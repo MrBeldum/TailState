@@ -90,9 +90,13 @@ After claiming the installation, the authenticated Settings page asks for:
 5. Optional expiry warning windows (default `14, 3` days) and an expiry tag
    filter; see [Expiry warnings](#expiry-warnings).
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Each collector row lists its state, last success, next scheduled poll, last poll duration, consecutive failures, and details; every time is shown in UTC with a relative hint ("3 min ago"). **Reconcile now** requests an immediate poll of every collector (a CSRF-protected form, limited to one request every 30 seconds). The **Delivery by destination** table shows pending, processing, and dead notifications per destination, and **Retry dead letters** requeues an enabled destination's dead letters with a fresh 24-hour delivery window. Dead letters from a previous tailnet/OAuth identity are never requeued, a disabled destination must be enabled first, and delivery remains at-least-once, so a message the provider had already accepted can arrive again. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
-The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
+The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports. History can be narrowed to a UTC date range (both dates inclusive) and paged in both directions with **Load newer changes** and **Load older changes**; the range carries over to the evidence-pack download, whose signed `filter` then records `from` and `until` (exclusive). Packs without a date range keep their previous shape; a pack that uses one needs a verifier from this release or later.
+
+The interface follows the browser's light or dark preference and works down to 320-pixel-wide screens: the header wraps instead of overlapping, and on narrow screens table rows stack with every value labelled by its column name. Field differences carry "Old" and "New" text markers, so they do not depend on red/green colour. Errors are announced to screen readers, the current page is marked in the navigation, and repeated destination buttons are labelled with the destination name. The pages load no scripts and no inline styles, so the strict Content-Security-Policy stays unchanged.
+
+Destination actions (add, edit including routing and message format, enable, disable, send test, remove), mute rule changes, and the status page actions use Post/Redirect/Get: the result is shown once as a message on the page you return to, so reloading never sends another test notification or repeats an action. **Remove** opens a confirmation step that states how many pending notifications will be dead-lettered; the server refuses a removal that was not confirmed. If your session expired or was reset while a page was open, submitting a form clears the stale cookies and opens the login page, which then returns you to the page you were on; opening a bookmarked page while signed out returns you to it the same way. The return target must be one of TailState's own Status, History, or Settings pages: absolute, scheme-relative (`//host`), backslash, and percent-encoded variants are ignored and you land on the default page. A form submitted with a valid session but a missing or wrong CSRF token is refused with `403` and keeps the session.
 
 ### OAuth scopes
 
@@ -179,8 +183,11 @@ minutes.
 
 Polling remains enabled even when webhooks are configured. To reduce the time
 between a tailnet change and its explanation in TailState, create a webhook in
-the Tailscale admin console and enter its signing secret in **Settings**. Point
-the webhook at:
+the Tailscale admin console and enter its signing secret in **Settings**. The
+Settings page shows "Webhook acceleration: enabled" with the time of the last
+accepted delivery while a secret is stored, or "disabled" otherwise; the
+"Remove the configured webhook secret" option appears only when there is a
+secret to remove. Point the webhook at:
 
 ```text
 https://tailstate.example/webhooks/tailscale
@@ -704,7 +711,9 @@ database that already exceeds the configured ceiling. The limit covers the
 logical SQLite database, while the signed evidence ledger remains retained for
 audit and is never silently deleted to make room.
 
-Diagnostics and `/metrics` also expose the observed physical sizes of the main
+The Settings diagnostics show database use in MiB with its percentage of the
+configured limit. Settings diagnostics, `doctor`, and `/metrics` also expose the
+observed physical sizes of the main
 `tailstate.db` file, its `-wal` and `-shm` sidecars, and their total. These
 physical gauges are volume-safety observations, not additional enforcement
 limits; a missing transient sidecar is reported as zero. The logical
