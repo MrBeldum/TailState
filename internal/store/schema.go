@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 13 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -49,7 +49,12 @@ CREATE TABLE IF NOT EXISTS notification_destinations (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  deleted_at TEXT
+  deleted_at TEXT,
+  route_min_severity TEXT NOT NULL DEFAULT '',
+  route_include_collectors TEXT NOT NULL DEFAULT '',
+  route_exclude_collectors TEXT NOT NULL DEFAULT '',
+  route_change_kinds TEXT NOT NULL DEFAULT '',
+  message_format TEXT NOT NULL DEFAULT ''
 );
 -- Destination names are display labels, not identities. Duplicate names are
 -- intentionally allowed so two endpoints from the same provider can retain
@@ -157,7 +162,16 @@ CREATE TABLE IF NOT EXISTS events (
   before_bytes INTEGER NOT NULL DEFAULT 0,
   after_bytes INTEGER NOT NULL DEFAULT 0,
   before_truncated INTEGER NOT NULL DEFAULT 0,
-  after_truncated INTEGER NOT NULL DEFAULT 0
+  after_truncated INTEGER NOT NULL DEFAULT 0,
+  severity TEXT NOT NULL DEFAULT '',
+  muted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mute_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK(kind IN ('collector','field','tag','resource')),
+  value TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(kind, value)
 );
 CREATE TABLE IF NOT EXISTS evidence_ledger (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +197,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   created_at TEXT NOT NULL,
   delivered_at TEXT,
   lease_until TEXT,
-  lease_token TEXT NOT NULL DEFAULT ''
+  lease_token TEXT NOT NULL DEFAULT '',
+  payload_format TEXT NOT NULL DEFAULT 'markdown'
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, next_attempt);
 `

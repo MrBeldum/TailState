@@ -85,6 +85,10 @@ type OutboxItem struct {
 	DestinationID int64
 	Destination   NotificationDestination
 	Payload       string
+	// PayloadFormat is notify.PayloadMarkdown for pre-rendered Markdown
+	// (every row written before schema v14) or notify.PayloadMessage for a
+	// format-neutral message rendered at send time.
+	PayloadFormat string
 	Attempts      int
 	FirstAttempt  time.Time
 	LeaseUntil    *time.Time
@@ -150,6 +154,8 @@ type HistoryEvent struct {
 	AfterBytes      int64
 	BeforeTruncated bool
 	AfterTruncated  bool
+	Severity        string
+	Muted           bool
 }
 
 type HistoryDelivery struct {
@@ -181,6 +187,10 @@ type HistoryFilter struct {
 	ResourceID string
 	Cursor     int64
 	Limit      int
+	// BatchID selects exactly one batch, for notification deep links.
+	BatchID int64
+	// Severity selects events with exactly this built-in severity.
+	Severity string
 }
 
 type HistoryPage struct {
@@ -193,7 +203,7 @@ type HistoryPage struct {
 	TruncationReason string
 }
 
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour

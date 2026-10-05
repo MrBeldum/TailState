@@ -14,7 +14,19 @@ of truth and the safety net for missed events.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 
-The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, live user/device connectivity, public endpoints, connectivity metadata, profile-picture URLs, internal rotating node keys, operational status counters, response timestamps, ordering in set-like arrays, and unknown fields outside its monitored schema. DNS nameserver and search-path ordering is preserved because position determines resolver behavior. Tailscale client-version and `updateAvailable` changes remain alertable.
+The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications. What is ignored depends on the collector:
+
+| Collector | Monitored fields | Always ignored |
+| --- | --- | --- |
+| Every collector | (see below) | `lastSeen`, `connectedToControl`, `clientConnectivity`, `endpoints`, `lastUpdated`, `createdAt`, `updatedAt`, `timestamp`, `requestedAt`, `profilePicUrl`, and the order of set-like arrays. Secret values (for example `secret`, `token`, `password`, `clientSecret`, `s3SecretAccessKey`, `gcsCredentials`) and URL fields are replaced by SHA-256 fingerprints |
+| `devices` | Allowlist: `addresses`, `id`, `nodeId`, `user`, `name`, `hostname`, `clientVersion`, `updateAvailable`, `os`, `created`, `keyExpiryDisabled`, `expires`, `authorized`, `isExternal`, `blocksIncomingConnections`, `enabledRoutes`, `advertisedRoutes`, `tags`, `tailnetLockError`, `tailnetLockKey`, `sshEnabled`, `postureIdentity`, `isEphemeral`, `distro` | Any other top-level field, including `multipleConnections`, `machineKey`, and `nodeKey` (rotating keys) |
+| `users` | Allowlist: `id`, `displayName`, `loginName`, `tailnetId`, `created`, `type`, `role`, `status` (`active` and `idle` are both recorded as `enabled`) | Any other top-level field, including `currentlyConnected` and `deviceCount` |
+| `device_details` | Allowlist: `postureAttributes` and `deviceInvites` | Posture attribute `expiries` timestamps, and the `node:os`, `node:osVersion`, and `node:tsVersion` attributes (reported by `devices`) |
+| `posture` | Allowlist: `provider`, `cloudId`, `clientId`, `tenantId`, `id`, `configUpdated`, `status` (reduced to `healthy` or `error`) | Any other top-level field, such as synchronization counters |
+| `log_streaming` | Allowlist: `configuration`, `network`; stream status is reduced to `healthy`, `error`, or `unavailable` | Any other top-level field |
+| `keys`, `webhooks`, `user_invites`, `settings`, `contacts`, `dns`, `policy` | Open schema: every field except the global ignore list (policy is stored as section fingerprints) | Only the global ignore list |
+
+Because the last group has an open schema, a field that Tailscale adds to its API response appears on every resource of that collector at once. TailState reports that as one "upstream schema change" line in the digest (see [Noise controls](#noise-controls)); History still lists every resource. DNS nameserver and search-path ordering is preserved because position determines resolver behavior. Tailscale client-version and `updateAvailable` changes remain alertable.
 
 ## Quick start
 
@@ -386,9 +398,9 @@ in a disposable project before relying on the procedure for an outage.
 - One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift.
 - Failed or partial polls never delete snapshots.
 - Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
-- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
-- Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
-- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
+- Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
+- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 4) include normalized snapshots, field diffs, each event's severity and `muted` flag, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`. `evidence public-key` opens the database read-only and fails if the database, the current schema, or the stored signing key is missing; it never creates a database or a new key.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
@@ -396,7 +408,8 @@ in a disposable project before relying on the procedure for an outage.
 - Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a gateway retry that would not fit in that window reports the upstream status immediately. Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
 - If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
-- API collector failures alert after three consecutive failures and once on recovery.
+- API collector failures alert after three consecutive failures and once on recovery. Transitions observed in one poll are grouped into one message per destination (one "unhealthy" and later one "recovered"), each collector listed with a bounded reason: `auth rejected`, `rate limited`, `timeout`, `upstream 5xx`, `invalid response`, `unsupported`, or `network error`. Provider error text is never included. A revoked OAuth credential therefore produces one grouped alert per poll schedule (device and inventory collectors are polled on separate schedules) instead of one alert per collector.
+- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
 - A 403/404 from an optional plan-specific endpoint is treated as an
@@ -422,6 +435,59 @@ in a disposable project before relying on the procedure for an outage.
   explicitly returned `[]` is the healthy empty result. This prevents a
   malformed or permission-filtered response from looking like mass removal.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
+
+### Severity and routing
+
+Every change is classified with a built-in severity. The digest prefixes each
+line with 🔴 high, 🟠 medium, or ⚪ low and repeats the severity next to the
+collector, and History can be filtered by severity.
+
+| Severity | Changes |
+| --- | --- |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), or `webhooks` change; a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
+| Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, and posture changes |
+
+A changed resource takes the highest severity of its changed fields; a change
+whose field list was truncated is at least medium, because the omitted fields
+cannot be shown to be routine.
+
+Each destination has routing rules, edited under **Edit destination** in
+Settings: a minimum severity (all, medium and high, or high only), collectors
+to include (empty means all), collectors to exclude, and change kinds
+(created, changed, removed; none selected means all). Fan-out renders one
+digest per distinct rule set, so each destination receives only its matching
+changes, and a destination whose rules match nothing in a batch receives no
+digest. For example, a paging channel with "high only" receives nothing for a
+batch of client upgrades, while a default destination still receives it.
+Destinations created before routing existed, and new destinations, receive all
+changes. Collector health and release notifications are not inventory changes
+and always reach every enabled destination.
+
+### Noise controls
+
+Predictable noise is reduced in the digest without losing the audit trail:
+
+- **Mute rules** are managed under **Noise controls** in Settings (CSRF
+  protected). A rule mutes a collector (`dns`), one field path of a collector
+  (`devices.clientVersion`, which also covers nested paths below it), every
+  device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
+  one resource by ID or exact name. Muted changes are still recorded in History
+  and in the signed evidence ledger, flagged `muted` in the History page and in
+  evidence exports, but are left out of digests; the digest states how many
+  muted changes it omitted, and a batch of only muted changes sends nothing. A
+  change whose fields are only partly muted is notified with its remaining
+  fields. Rules apply to batches recorded after they are added; at most 200
+  rules are kept.
+- **Fleet summarisation:** when the same field transition (for example
+  `updateAvailable` false→true) affects at least 5 resources of a collector in
+  one batch, the digest shows one line such as
+  "`updateAvailable`: `false` → `true` on 143 resources (devices)" with a
+  History link when `TAILSTATE_PUBLIC_URL` is set.
+- **Schema-change detection:** when a field becomes newly present (or absent)
+  on every resource a collector returned in one batch (at least 2 resources),
+  the digest shows one "upstream schema change" line instead of one diff per
+  resource.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
 
@@ -489,6 +555,21 @@ unique batch constraint) and adds `outbox_dead_retention` and
 `auth_tokens_kind`, so every retention statement reaches its rows through an
 index search and a pass with nothing to delete stays cheap on large databases.
 
+Schema v14 adds per-destination routing rules and message format overrides,
+a built-in severity and a `muted` flag on every history event, the mute rule
+table, and a payload format on outbox rows. Notifications queued before the
+upgrade are marked as pre-rendered Markdown and are delivered exactly as they
+were stored; only notifications queued after the upgrade are rendered per
+service. Existing
+destinations default to receiving all changes and no existing event is muted,
+so the upgrade does not change delivery. Existing events are classified in
+bounded, resumable 64-row transactions during the migration; severity is
+derived data and is not part of the signed ledger payload, and the ledger
+payload records `muted` only when it is set, so the existing chain and every
+previously exported pack still verify. New exports use evidence format version
+4, which adds per-event `severity` and `muted`; `tailstate evidence verify`
+accepts both version 3 and version 4 packs.
+
 ## Runtime configuration
 
 Only bootstrap settings use environment variables; application credentials and
@@ -504,6 +585,8 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
+| `TAILSTATE_PUBLIC_URL` | empty | External `https://` base URL of this instance (no credentials, query, or fragment). Digests then link to `/history?batch=<id>` and health alerts to `/status`; empty emits no links |
+| `TAILSTATE_INSTANCE_LABEL` | empty | Optional instance name (at most 64 printable bytes) shown in every notification title next to the tailnet |
 | `TAILSTATE_CONTAINER` | `false` (`1` in the image) | Marks the official container image; its wildcard listener is then an informational diagnostic |
 | `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |
 | `TAILSTATE_EVENT_VALUE_LIMIT_BYTES` | `524288` | Maximum before/after value retained per history event; `0` uses the default |

@@ -35,6 +35,10 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		where = append(where, "b.id < ?")
 		args = append(args, filter.Cursor)
 	}
+	if filter.BatchID > 0 {
+		where = append(where, "b.id = ?")
+		args = append(args, filter.BatchID)
+	}
 	if filter.Collector != "" {
 		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
 		args = append(args, filter.Collector)
@@ -47,6 +51,10 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? ESCAPE '\\' OR e.name LIKE ? ESCAPE '\\'))")
 		term := "%" + escapeLike(filter.ResourceID) + "%"
 		args = append(args, term, term)
+	}
+	if filter.Severity != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.severity=?)")
+		args = append(args, filter.Severity)
 	}
 	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
@@ -95,7 +103,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 			return HistoryPage{}, err
 		}
 		if len(loaded.Events) > 0 {
-			if filter.Collector != "" || filter.EventType != "" || filter.ResourceID != "" {
+			if filter.Collector != "" || filter.EventType != "" || filter.ResourceID != "" || filter.Severity != "" {
 				loaded.ChangeCount = len(loaded.Events)
 			}
 			loadedBatches = append(loadedBatches, loaded)
@@ -138,6 +146,10 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 		eventWhere = append(eventWhere, "(resource_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
 		term := "%" + escapeLike(filter.ResourceID) + "%"
 		eventArgs = append(eventArgs, term, term)
+	}
+	if filter.Severity != "" {
+		eventWhere = append(eventWhere, "severity=?")
+		eventArgs = append(eventArgs, filter.Severity)
 	}
 	var eventBytes int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(
@@ -223,7 +235,11 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		term := "%" + escapeLike(filter.ResourceID) + "%"
 		eventArgs = append(eventArgs, term, term)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated
+	if filter.Severity != "" {
+		eventWhere = append(eventWhere, "severity=?")
+		eventArgs = append(eventArgs, filter.Severity)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -234,10 +250,11 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		var event HistoryEvent
 		var observed string
 		var fieldsRaw, beforeRaw, afterRaw []byte
-		var beforeTruncated, afterTruncated int
-		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated); err != nil {
+		var beforeTruncated, afterTruncated, muted int
+		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated, &event.Severity, &muted); err != nil {
 			return HistoryBatch{}, err
 		}
+		event.Muted = muted == 1
 		event.BeforeTruncated = beforeTruncated == 1
 		event.AfterTruncated = afterTruncated == 1
 		if marker, ok := parseTruncationMarker(beforeRaw); ok {
@@ -399,4 +416,30 @@ func parseOptionalTimeStrict(value string) (*time.Time, error) {
 
 func truncate(value string, n int) string {
 	return textutil.Truncate(value, n)
+}
+
+// decodeStoredFields reads a persisted field list in either the legacy bare
+// array form or the envelope that records field truncation.
+func decodeStoredFields(raw []byte) ([]model.FieldChange, bool, int, error) {
+	if len(raw) == 0 {
+		return nil, false, 0, nil
+	}
+	var fields []model.FieldChange
+	if err := json.Unmarshal(raw, &fields); err == nil {
+		return fields, false, 0, nil
+	} else {
+		var persisted persistedFields
+		if envelopeErr := json.Unmarshal(raw, &persisted); envelopeErr != nil {
+			return nil, false, 0, err
+		}
+		return persisted.Fields, persisted.FieldsTruncated, persisted.TotalFields, nil
+	}
+}
+
+// classifyStoredEvent applies the built-in severity table to a persisted
+// event. Undecodable field data is classified without fields (medium for a
+// changed device) rather than failing the read.
+func classifyStoredEvent(collector, kind string, changes []byte) model.Severity {
+	fields, truncated, total, _ := decodeStoredFields(changes)
+	return model.Classify(model.Change{Kind: kind, Collector: collector, Fields: fields, FieldsTruncated: truncated, TotalFields: total})
 }

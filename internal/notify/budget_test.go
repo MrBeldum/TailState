@@ -21,12 +21,14 @@ func largeDigest(changes int) string {
 		list = append(list, model.Change{
 			Kind: "changed", Collector: "devices", Name: fmt.Sprintf("server-%03d", i),
 			Fields: []model.FieldChange{
-				{Field: "tags", Old: []any{"tag:prod"}, New: []any{"tag:prod", "tag:db"}},
-				{Field: "clientVersion", Old: "1.80.0", New: "1.82.1"},
+				// Values differ per device so fleet summarisation does not
+				// collapse the fixture into one line.
+				{Field: "tags", Old: []any{"tag:prod"}, New: []any{"tag:prod", fmt.Sprintf("tag:db-%03d", i)}},
+				{Field: "clientVersion", Old: fmt.Sprintf("1.80.%d", i), New: "1.82.1"},
 			},
 		})
 	}
-	return Digest(list)
+	return digestText(list)
 }
 
 // TestDigestFitsEveryServiceBudget guards the regression where digests up to
@@ -59,7 +61,7 @@ func TestDigestMarksFieldsDroppedAtTheBudget(t *testing.T) {
 	for i := range fields {
 		fields[i] = model.FieldChange{Field: "field", Old: strings.Repeat("o", 180), New: strings.Repeat("n", 180)}
 	}
-	message := Digest([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
+	message := digestText([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
 	if !strings.Contains(message, "Additional field changes omitted; total: 100") {
 		t.Fatalf("dropped field lines were not marked: %s", message[len(message)-300:])
 	}
