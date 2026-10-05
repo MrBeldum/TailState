@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"database/sql"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,16 +42,42 @@ type Server struct {
 	templates            map[string]*template.Template
 	loginMu              sync.Mutex
 	loginAttempts        map[string][]time.Time
+	globalFailures       map[credentialAction][]time.Time
+	settingsTestTimeout  time.Duration
 	authWork             chan struct{}
 	challengeKey         []byte
 	challengeMu          sync.Mutex
-	challenges           map[string]credentialChallengeRecord
+	consumedChallenges   map[string]time.Time
+	consumedPrunedAt     time.Time
 	metricsMu            sync.Mutex
 	challengeCounts      map[credentialChallengeMetric]uint64
 	credentialRejections map[string]uint64
+	webhookOutcomes      map[string]uint64
 }
 
-const maxTrackedLoginIPs = 4096
+const (
+	// serverWriteTimeout is the default per-response write deadline.
+	serverWriteTimeout = 30 * time.Second
+	// defaultSettingsTestTimeout bounds the Tailscale connection test run by
+	// a settings save. settingsRenderAllowance is the time left afterwards to
+	// render the result; together they stay below serverWriteTimeout.
+	defaultSettingsTestTimeout = 20 * time.Second
+	settingsRenderAllowance    = 5 * time.Second
+	maxTrackedLoginIPs         = 4096
+	// loginFailureWindow and loginFailuresPerClient define the per-client
+	// credential throttle.
+	loginFailureWindow     = 15 * time.Minute
+	loginFailuresPerClient = 5
+	// loginIPv6PrefixBits aggregates IPv6 clients by network rather than by
+	// address, because one host can usually choose any address in its /64.
+	loginIPv6PrefixBits = 64
+	// loginGlobalFailureBudget failures per action and window from any mix of
+	// sources engage an exponential backoff of loginGlobalBackoffBase,
+	// doubling per further failure up to loginGlobalBackoffMax.
+	loginGlobalFailureBudget = 30
+	loginGlobalBackoffBase   = time.Second
+	loginGlobalBackoffMax    = 5 * time.Minute
+)
 
 type pageData struct {
 	Error, Message, CSRF, Challenge string
@@ -67,6 +95,7 @@ type pageData struct {
 	EvidenceSigningKeyID            string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
+	NotificationState               diagnostics.NotificationState
 	Diagnostics                     diagnostics.Report
 }
 
@@ -107,23 +136,30 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		engine:               engine,
 		templates:            templates,
 		loginAttempts:        map[string][]time.Time{},
+		globalFailures:       map[credentialAction][]time.Time{},
+		settingsTestTimeout:  defaultSettingsTestTimeout,
 		authWork:             make(chan struct{}, 2),
 		challengeKey:         challengeKey,
-		challenges:           map[string]credentialChallengeRecord{},
+		consumedChallenges:   map[string]time.Time{},
 		challengeCounts:      map[credentialChallengeMetric]uint64{},
 		credentialRejections: map[string]uint64{},
+		webhookOutcomes:      map[string]uint64{},
 	}, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	staticFS, _ := fs.Sub(assets, "static")
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", staticFiles(http.FileServer(http.FS(staticFS)))))
+	mux.HandleFunc("GET /favicon.ico", favicon)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("POST /webhooks/tailscale", s.tailscaleWebhook)
-	mux.HandleFunc("GET /", s.home)
+	// "/{$}" matches only the root. A bare "GET /" would be a catch-all that
+	// turned every typo (and every browser favicon probe) into a status
+	// lookup and redirect; unknown paths now return 404.
+	mux.HandleFunc("GET /{$}", s.home)
 	mux.HandleFunc("GET /setup", s.setup)
 	mux.HandleFunc("POST /setup/claim", s.claim)
 	mux.HandleFunc("GET /login", s.login)
@@ -149,8 +185,26 @@ func (s *Server) Handler() http.Handler {
 	return s.security(mux)
 }
 
+// staticFiles serves embedded assets but never a directory listing.
+func staticFiles(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "" || strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// favicon answers the browser's automatic favicon probe without touching the
+// store. TailState ships no icon, so the response is an empty, cacheable 204.
+func favicon(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) Serve(ctx context.Context) error {
-	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: serverWriteTimeout, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("TailState web server listening", "address", s.config.ListenAddr)
@@ -186,8 +240,15 @@ func (s *Server) security(next http.Handler) http.Handler {
 	})
 }
 func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
+	s.renderStatus(w, name, data, http.StatusOK)
+}
+
+func (s *Server) renderStatus(w http.ResponseWriter, name string, data pageData, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data.Version = s.config.Version
+	if code != http.StatusOK {
+		w.WriteHeader(code)
+	}
 	if err := s.templates[name].Execute(w, data); err != nil {
 		slog.Error("render template", "template", name, "error", err)
 	}
@@ -226,7 +287,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
-	s.renderCredential(w, "setup", credentialActionSetup, pageData{})
+	s.renderCredential(w, r, "setup", credentialActionSetup, pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	exists, ok := s.adminExists(w, r)
@@ -237,9 +298,9 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation already claimed", http.StatusConflict)
 		return
 	}
-	ip := "setup:" + s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Too many setup attempts. Try again later."})
+	ip := s.throttleKey(credentialActionSetup, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionSetup, ip); limited {
+		s.renderThrottled(w, r, "setup", credentialActionSetup, "Too many setup attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -247,7 +308,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionSetup) {
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -261,18 +322,18 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		// Password confirmation is part of the unauthenticated setup surface.
 		// Count mismatches as failed claims so an attacker cannot bypass the
 		// endpoint throttle by repeatedly submitting different confirmations.
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionSetup, ip)
 		s.recordCredentialRejection(credentialActionSetup)
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionSetup, ip)
 		s.recordCredentialRejection(credentialActionSetup)
 		// Setup is unauthenticated. Keep storage, token, and migration details
 		// out of the response so this endpoint cannot become an oracle.
 		slog.Debug("setup claim rejected", "error", err)
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Setup could not be completed. Check the setup token and try again."})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Setup could not be completed. Check the setup token and try again."})
 		return
 	}
 	s.clearFailures(ip)
@@ -295,7 +356,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/status", http.StatusSeeOther)
 		return
 	}
-	s.renderCredential(w, "login", credentialActionLogin, pageData{})
+	s.renderCredential(w, r, "login", credentialActionLogin, pageData{})
 }
 
 func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool) {
@@ -309,9 +370,9 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	ip := s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: "Too many login attempts. Try again later."})
+	ip := s.throttleKey(credentialActionLogin, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionLogin, ip); limited {
+		s.renderThrottled(w, r, "login", credentialActionLogin, "Too many login attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -319,7 +380,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionLogin) {
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -330,9 +391,9 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionLogin, ip)
 		s.recordCredentialRejection(credentialActionLogin)
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: "Invalid password."})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password."})
 		return
 	}
 	s.clearFailures(ip)
@@ -355,12 +416,12 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
-	s.renderCredential(w, "reset", credentialActionReset, pageData{})
+	s.renderCredential(w, r, "reset", credentialActionReset, pageData{})
 }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	ip := "reset:" + s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "Too many reset attempts. Try again later."})
+	ip := s.throttleKey(credentialActionReset, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionReset, ip); limited {
+		s.renderThrottled(w, r, "reset", credentialActionReset, "Too many reset attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -368,7 +429,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionReset) {
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -379,19 +440,19 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.FormValue("password") != r.FormValue("confirm") {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
 		// Do not disclose whether a reset token is missing, invalid, expired,
 		// or temporarily unreadable. The token is deliberately a single
 		// generic oracle to unauthenticated callers.
 		slog.Debug("password reset rejected", "error", err)
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "The reset token is invalid or expired."})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "The reset token is invalid or expired."})
 		return
 	}
 	s.clearFailures(ip)
@@ -553,8 +614,8 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", 400)
 		return
 	}
-	device, err1 := strconv.ParseInt(r.FormValue("device_interval"), 10, 64)
-	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
+	device, err1 := strconv.ParseInt(strings.TrimSpace(r.FormValue("device_interval")), 10, 64)
+	inventory, err2 := strconv.ParseInt(strings.TrimSpace(r.FormValue("inventory_interval")), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		slog.Error("load settings for update", "error", currentErr)
@@ -563,7 +624,10 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	configured := currentErr == nil
 	clearWebhookSecret := r.FormValue("clear_webhook_secret") == "on" || r.FormValue("clear_webhook_secret") == "true"
-	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret, DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
+	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret}
+	if input.Tailnet == "" {
+		input.Tailnet = "-"
+	}
 	if configured {
 		if input.OAuthClientSecret == "" {
 			input.OAuthClientSecret = current.OAuthClientSecret
@@ -574,13 +638,20 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	data := s.settingsData(r.Context(), csrf, configured, input, r)
 	data.DeviceSeconds, data.InventorySeconds = device, inventory
-	if err1 != nil || err2 != nil {
-		data.Error = "Poll intervals must be whole seconds."
+	// Validate everything that needs no I/O before contacting Tailscale, so
+	// an invalid form fails instantly with a specific message.
+	if message := settingsInputError(&input, device, inventory, err1, err2); message != "" {
+		data.Error = message
 		s.render(w, "settings", data)
 		return
 	}
 	client := tailscale.New(s.config.TailscaleBase, s.config.OAuthTokenURL, s.config.Version, tailscale.Credentials{Tailnet: input.Tailnet, ClientID: input.OAuthClientID, ClientSecret: input.OAuthClientSecret})
-	testCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// The connection test must finish, and its result page render, before
+	// the server's write deadline; otherwise a slow API produces a blank
+	// connection reset instead of "Tailscale test failed". Bound the test
+	// below the deadline and extend this response's deadline to cover it.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.settingsTestTimeout + settingsRenderAllowance))
+	testCtx, cancel := context.WithTimeout(r.Context(), s.settingsTestTimeout)
 	defer cancel()
 	if err := client.Test(testCtx); err != nil {
 		data.Error = "Tailscale test failed: " + tailscale.SafeError(err)
@@ -619,6 +690,42 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
 }
 
+// settingsInputError validates the settings form locally and, when valid,
+// stores the parsed intervals in input. Seconds are range-checked before they
+// are converted to a time.Duration so huge values cannot overflow.
+func settingsInputError(input *store.Settings, device, inventory int64, deviceErr, inventoryErr error) string {
+	maxSeconds := int64(store.MaxPollInterval / time.Second)
+	for _, field := range []struct {
+		label   string
+		seconds int64
+		err     error
+		min     time.Duration
+	}{
+		{"Device", device, deviceErr, store.MinDevicePollInterval},
+		{"Inventory", inventory, inventoryErr, store.MinInventoryPollInterval},
+	} {
+		minSeconds := int64(field.min / time.Second)
+		if field.err != nil && !errors.Is(field.err, strconv.ErrRange) {
+			return field.label + " poll interval must be a whole number of seconds."
+		}
+		if field.err != nil || field.seconds < minSeconds || field.seconds > maxSeconds {
+			return fmt.Sprintf("%s poll interval must be between %d and %d seconds.", field.label, minSeconds, maxSeconds)
+		}
+	}
+	input.DeviceInterval = time.Duration(device) * time.Second
+	input.InventoryInterval = time.Duration(inventory) * time.Second
+	if input.OAuthClientID == "" || input.OAuthClientSecret == "" {
+		return "OAuth client ID and secret are required."
+	}
+	if len(input.WebhookSecret) > store.MaxWebhookSecretBytes {
+		return fmt.Sprintf("Webhook secret must be at most %d bytes.", store.MaxWebhookSecretBytes)
+	}
+	if err := store.ValidateSettings(*input); err != nil {
+		return "Tailnet must be \"-\" or a tailnet name without spaces, slashes, or URL syntax."
+	}
+	return ""
+}
+
 func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {
 	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request)}
 	destinations, err := s.store.ListDestinations(ctx)
@@ -627,13 +734,14 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		for _, destination := range destinations {
 			data.Destinations = append(data.Destinations, destinationPage{ID: destination.ID, Name: destination.Name, DisplayURL: notify.RedactURL(destination.ServiceURL), Enabled: destination.Enabled})
 		}
-		data.NotificationsPaused = configured
+		enabled := 0
 		for _, destination := range data.Destinations {
 			if destination.Enabled {
-				data.NotificationsPaused = false
-				break
+				enabled++
 			}
 		}
+		data.NotificationState = diagnostics.NotificationStateFor(configured, len(data.Destinations), enabled)
+		data.NotificationsPaused = data.NotificationState.Paused()
 	}
 	return data
 }
@@ -796,6 +904,42 @@ func destinationMutationMessage(action string, err error) string {
 	}
 }
 
+// Webhook request outcomes, exported as tailstate_webhook_requests_total.
+// Signature failures and content-bounds fallbacks are deliberately distinct.
+const (
+	webhookOutcomeAccepted         = "accepted"
+	webhookOutcomeContentFallback  = "content_fallback"
+	webhookOutcomeDuplicate        = "duplicate"
+	webhookOutcomeInvalidSignature = "invalid_signature"
+	webhookOutcomeMalformed        = "malformed"
+	webhookOutcomeTooLarge         = "too_large"
+	webhookOutcomeNotConfigured    = "not_configured"
+	webhookOutcomeUnavailable      = "unavailable"
+)
+
+var webhookOutcomes = []string{
+	webhookOutcomeAccepted,
+	webhookOutcomeContentFallback,
+	webhookOutcomeDuplicate,
+	webhookOutcomeInvalidSignature,
+	webhookOutcomeMalformed,
+	webhookOutcomeTooLarge,
+	webhookOutcomeNotConfigured,
+	webhookOutcomeUnavailable,
+}
+
+func (s *Server) recordWebhookOutcome(outcome string) {
+	s.metricsMu.Lock()
+	s.webhookOutcomes[outcome]++
+	s.metricsMu.Unlock()
+}
+
+func (s *Server) webhookOutcomeCount(outcome string) uint64 {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.webhookOutcomes[outcome]
+}
+
 func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	if !webhook.Method(r.Method) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -804,30 +948,52 @@ func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	secret, err := s.store.WebhookSecret(r.Context())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.recordWebhookOutcome(webhookOutcomeNotConfigured)
 			http.Error(w, "webhook not configured", http.StatusNotFound)
 			return
 		}
+		s.recordWebhookOutcome(webhookOutcomeUnavailable)
 		http.Error(w, "webhook unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if secret == "" {
+		s.recordWebhookOutcome(webhookOutcomeNotConfigured)
 		http.Error(w, "webhook not configured", http.StatusNotFound)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "invalid webhook body", http.StatusRequestEntityTooLarge)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.recordWebhookOutcome(webhookOutcomeTooLarge)
+			http.Error(w, "webhook body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		s.recordWebhookOutcome(webhookOutcomeMalformed)
+		http.Error(w, "invalid webhook body", http.StatusBadRequest)
 		return
 	}
 	delivery, err := webhook.Verify(body, r.Header.Get("Tailscale-Webhook-Signature"), secret, time.Now().UTC())
 	if err != nil {
-		// Keep verification details out of responses and logs; callers only need
-		// to know that Tailscale should not retry this malformed delivery.
-		http.Error(w, "invalid webhook signature or body", http.StatusUnauthorized)
+		// Keep verification details out of responses and logs. 401 is reserved
+		// for signature and timestamp failures; size and shape problems get
+		// their own status so operators debug the right thing.
+		switch {
+		case errors.Is(err, webhook.ErrBodyTooLarge):
+			s.recordWebhookOutcome(webhookOutcomeTooLarge)
+			http.Error(w, "webhook body too large", http.StatusRequestEntityTooLarge)
+		case errors.Is(err, webhook.ErrMalformedBody):
+			s.recordWebhookOutcome(webhookOutcomeMalformed)
+			http.Error(w, "invalid webhook body", http.StatusBadRequest)
+		default:
+			s.recordWebhookOutcome(webhookOutcomeInvalidSignature)
+			http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		}
 		return
 	}
 	trigger, created, err := s.store.RecordWebhookTrigger(r.Context(), delivery.BodyHash, delivery.EventTypes, delivery.Collectors)
 	if err != nil {
+		s.recordWebhookOutcome(webhookOutcomeUnavailable)
 		http.Error(w, "record webhook", http.StatusInternalServerError)
 		return
 	}
@@ -836,10 +1002,24 @@ func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	status := "accepted"
+	outcome := webhookOutcomeAccepted
+	if delivery.FallbackReason != "" {
+		outcome = webhookOutcomeContentFallback
+		// The reason is a fixed vocabulary; no provider content is logged.
+		slog.Warn("authentic webhook content exceeded TailState bounds; requesting full reconciliation", "reason", delivery.FallbackReason, "events", len(delivery.Events), "trigger_id", trigger.ID)
+	}
 	if !created {
 		status = "duplicate"
+		outcome = webhookOutcomeDuplicate
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": status, "trigger_id": trigger.ID})
+	s.recordWebhookOutcome(outcome)
+	response := map[string]any{"status": status, "trigger_id": trigger.ID}
+	if len(delivery.Collectors) == 0 {
+		response["reconciliation"] = "full"
+	} else {
+		response["reconciliation"] = "targeted"
+	}
+	writeJSON(w, http.StatusAccepted, response)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -915,93 +1095,184 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metrics authorization required", http.StatusUnauthorized)
 		return
 	}
+	// Collect everything that can fail before writing a single byte, and
+	// render into a buffer: a scrape either receives a complete exposition
+	// or a clean 500, never a 200 with a truncated or corrupted body.
 	status, err := s.store.Status(r.Context())
 	if err != nil {
+		slog.Error("load status for metrics", "error", err)
 		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	ready := 0
-	if status.Configured && status.BaselineReady {
-		ready = 1
+	storage, err := s.store.StorageMetrics(r.Context())
+	if err != nil {
+		slog.Error("load storage metrics", "error", err)
+		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
+		return
 	}
-	fmt.Fprintf(w, "# HELP tailstate_ready Whether setup and baseline are complete.\n# TYPE tailstate_ready gauge\ntailstate_ready %d\n", ready)
-	degraded := 0
-	if status.BaselineDegraded {
-		degraded = 1
+	var body bytes.Buffer
+	s.writeMetrics(&body, status, storage, s.store.StorageLimits())
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(body.Len()))
+	_, _ = w.Write(body.Bytes())
+}
+
+// metricFamily writes the HELP and TYPE header that must precede every
+// family's samples in the Prometheus text exposition format.
+func metricFamily(b *bytes.Buffer, name, kind, help string) {
+	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+}
+
+// metricValue writes a single unlabelled family.
+func metricValue(b *bytes.Buffer, name, kind, help string, value any) {
+	metricFamily(b, name, kind, help)
+	switch v := value.(type) {
+	case float64:
+		fmt.Fprintf(b, "%s %.6f\n", name, v)
+	default:
+		fmt.Fprintf(b, "%s %d\n", name, v)
 	}
-	fmt.Fprintf(w, "# TYPE tailstate_baseline_degraded gauge\ntailstate_baseline_degraded %d\n", degraded)
+}
+
+func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage store.StorageMetrics, limits store.StorageLimits) {
+	metricValue(b, "tailstate_ready", "gauge", "Whether setup and baseline are complete.", boolMetric(status.Configured && status.BaselineReady))
+	metricValue(b, "tailstate_baseline_degraded", "gauge", "Whether the baseline is ready but one or more collectors are degraded.", boolMetric(status.BaselineDegraded))
 	dueErrors := uint64(0)
 	if s.engine != nil {
 		dueErrors = s.engine.CollectorDueErrors()
 	}
-	fmt.Fprintf(w, "# TYPE tailstate_collector_due_errors_total counter\ntailstate_collector_due_errors_total %d\n", dueErrors)
-	fmt.Fprintln(w, "# HELP tailstate_credential_challenge_total Credential form challenge outcomes by action.")
-	fmt.Fprintln(w, "# TYPE tailstate_credential_challenge_total counter")
+	metricValue(b, "tailstate_collector_due_errors_total", "counter", "Scheduler database errors while selecting due collectors.", dueErrors)
+	metricFamily(b, "tailstate_credential_challenge_total", "counter", "Credential form challenge outcomes by action.")
 	for _, action := range credentialActions {
 		for _, outcome := range credentialChallengeOutcomes {
-			fmt.Fprintf(w, "tailstate_credential_challenge_total{action=%q,outcome=%q} %d\n", action, outcome, s.credentialChallengeCount(action, outcome))
+			fmt.Fprintf(b, "tailstate_credential_challenge_total{action=%q,outcome=%q} %d\n", action, outcome, s.credentialChallengeCount(action, outcome))
 		}
 	}
-	fmt.Fprintln(w, "# HELP tailstate_credential_rejections_total Credential form submissions rejected after challenge validation.")
-	fmt.Fprintln(w, "# TYPE tailstate_credential_rejections_total counter")
+	metricFamily(b, "tailstate_credential_rejections_total", "counter", "Credential form submissions rejected after challenge validation.")
 	for _, action := range credentialActions {
-		fmt.Fprintf(w, "tailstate_credential_rejections_total{action=%q} %d\n", action, s.credentialRejectionCount(action))
+		fmt.Fprintf(b, "tailstate_credential_rejections_total{action=%q} %d\n", action, s.credentialRejectionCount(action))
 	}
-	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_processing gauge\ntailstate_outbox_processing %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Processing, status.Dead)
+	metricValue(b, "tailstate_outbox_pending", "gauge", "Notifications waiting for delivery.", status.Pending)
+	metricValue(b, "tailstate_outbox_processing", "gauge", "Notifications currently leased for delivery.", status.Processing)
+	metricValue(b, "tailstate_outbox_dead", "gauge", "Notifications that exhausted their delivery window.", status.Dead)
 	if s.engine != nil {
 		delivery := s.engine.DeliveryMetrics()
-		fmt.Fprintf(w, "# TYPE tailstate_outbox_delivery_attempts_total counter\ntailstate_outbox_delivery_attempts_total %d\n# TYPE tailstate_outbox_delivery_success_total counter\ntailstate_outbox_delivery_success_total %d\n# TYPE tailstate_outbox_delivery_failure_total counter\ntailstate_outbox_delivery_failure_total %d\n# TYPE tailstate_outbox_lease_renewals_total counter\ntailstate_outbox_lease_renewals_total %d\n# TYPE tailstate_outbox_lease_renewal_failures_total counter\ntailstate_outbox_lease_renewal_failures_total %d\n# TYPE tailstate_outbox_lease_losses_total counter\ntailstate_outbox_lease_losses_total %d\n", delivery.Attempts, delivery.Successes, delivery.Failures, delivery.LeaseRenewals, delivery.LeaseRenewalFailures, delivery.LeaseLosses)
-		fmt.Fprintln(w, "# TYPE tailstate_outbox_delivery_duration_seconds histogram")
+		metricValue(b, "tailstate_outbox_delivery_attempts_total", "counter", "Notification delivery attempts.", delivery.Attempts)
+		metricValue(b, "tailstate_outbox_delivery_success_total", "counter", "Successful notification deliveries.", delivery.Successes)
+		metricValue(b, "tailstate_outbox_delivery_failure_total", "counter", "Failed notification delivery attempts.", delivery.Failures)
+		metricValue(b, "tailstate_outbox_lease_renewals_total", "counter", "Delivery lease renewals.", delivery.LeaseRenewals)
+		metricValue(b, "tailstate_outbox_lease_renewal_failures_total", "counter", "Delivery lease renewal failures.", delivery.LeaseRenewalFailures)
+		metricValue(b, "tailstate_outbox_lease_losses_total", "counter", "Delivery leases lost before completion.", delivery.LeaseLosses)
+		metricFamily(b, "tailstate_outbox_delivery_duration_seconds", "histogram", "Notification delivery attempt duration.")
 		for i, bound := range monitor.DeliveryDurationBucketBounds() {
-			fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"%.3g\"} %d\n", bound, delivery.DurationBuckets[i])
+			fmt.Fprintf(b, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"%.3g\"} %d\n", bound, delivery.DurationBuckets[i])
 		}
-		fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\ntailstate_outbox_delivery_duration_seconds_sum %.6f\ntailstate_outbox_delivery_duration_seconds_count %d\n", delivery.DurationCount, delivery.DurationSeconds, delivery.DurationCount)
+		fmt.Fprintf(b, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\ntailstate_outbox_delivery_duration_seconds_sum %.6f\ntailstate_outbox_delivery_duration_seconds_count %d\n", delivery.DurationCount, delivery.DurationSeconds, delivery.DurationCount)
 		cleanup := s.engine.CleanupMetrics()
-		remaining := 0
-		if cleanup.Remaining {
-			remaining = 1
-		}
-		fmt.Fprintf(w, "# TYPE tailstate_cleanup_runs_total counter\ntailstate_cleanup_runs_total %d\n# TYPE tailstate_cleanup_failures_total counter\ntailstate_cleanup_failures_total %d\n# TYPE tailstate_cleanup_remaining gauge\ntailstate_cleanup_remaining %d\n# TYPE tailstate_cleanup_remaining_passes_total counter\ntailstate_cleanup_remaining_passes_total %d\n# TYPE tailstate_cleanup_transactions_total counter\ntailstate_cleanup_transactions_total %d\n# TYPE tailstate_cleanup_duration_seconds_sum counter\ntailstate_cleanup_duration_seconds_sum %.6f\n# TYPE tailstate_cleanup_duration_seconds_count counter\ntailstate_cleanup_duration_seconds_count %d\n", cleanup.Runs, cleanup.Failures, remaining, cleanup.RemainingPasses, cleanup.Transactions, cleanup.DurationSeconds, cleanup.Runs)
-		fmt.Fprintf(w, "# TYPE tailstate_cleanup_rows_total counter\ntailstate_cleanup_rows_total{table=\"sessions\"} %d\ntailstate_cleanup_rows_total{table=\"auth_tokens\"} %d\ntailstate_cleanup_rows_total{table=\"meta\"} %d\ntailstate_cleanup_rows_total{table=\"outbox_dead_letter\"} %d\ntailstate_cleanup_rows_total{table=\"webhook_dead_letter\"} %d\ntailstate_cleanup_rows_total{table=\"events\"} %d\ntailstate_cleanup_rows_total{table=\"event_batches\"} %d\ntailstate_cleanup_rows_total{table=\"event_batch_triggers\"} %d\ntailstate_cleanup_rows_total{table=\"webhook_triggers\"} %d\ntailstate_cleanup_rows_total{table=\"delivered_outbox\"} %d\ntailstate_cleanup_rows_total{table=\"dead_outbox\"} %d\n", cleanup.SessionsDeleted, cleanup.AuthTokensDeleted, cleanup.MetaDeleted, cleanup.OutboxDeadLettered, cleanup.WebhookDeadLettered, cleanup.EventsDeleted, cleanup.EventBatchesDeleted, cleanup.EventBatchTriggersDeleted, cleanup.WebhookTriggersDeleted, cleanup.DeliveredOutboxDeleted, cleanup.DeadOutboxDeleted)
-	}
-	storage, err := s.store.StorageMetrics(r.Context())
-	if err != nil {
-		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
-		return
-	}
-	limits := s.store.StorageLimits()
-	fmt.Fprintf(w, "# TYPE tailstate_storage_bytes gauge\ntailstate_storage_bytes %d\n# TYPE tailstate_storage_limit_bytes gauge\ntailstate_storage_limit_bytes %d\n# TYPE tailstate_storage_pressure_ratio gauge\ntailstate_storage_pressure_ratio %.6f\n# HELP tailstate_storage_enforced_limit_bytes Page ceiling SQLite enforces on the active connection.\n# TYPE tailstate_storage_enforced_limit_bytes gauge\ntailstate_storage_enforced_limit_bytes %d\n# HELP tailstate_storage_limit_enforced Whether the enforced page ceiling is within the configured database budget.\n# TYPE tailstate_storage_limit_enforced gauge\ntailstate_storage_limit_enforced %d\n# HELP tailstate_storage_database_file_bytes Physical bytes used by the main SQLite database file.\n# TYPE tailstate_storage_database_file_bytes gauge\ntailstate_storage_database_file_bytes %d\n# HELP tailstate_storage_wal_bytes Physical bytes used by the SQLite WAL sidecar.\n# TYPE tailstate_storage_wal_bytes gauge\ntailstate_storage_wal_bytes %d\n# HELP tailstate_storage_shm_bytes Physical bytes used by the SQLite shared-memory sidecar.\n# TYPE tailstate_storage_shm_bytes gauge\ntailstate_storage_shm_bytes %d\n# HELP tailstate_storage_physical_bytes Total physical bytes used by the SQLite database and sidecars.\n# TYPE tailstate_storage_physical_bytes gauge\ntailstate_storage_physical_bytes %d\n# TYPE tailstate_snapshot_truncations_total counter\ntailstate_snapshot_truncations_total %d\n# TYPE tailstate_event_value_truncations_total counter\ntailstate_event_value_truncations_total %d\n# TYPE tailstate_history_page_truncations_total counter\ntailstate_history_page_truncations_total %d\n# TYPE tailstate_oversized_writes_rejected_total counter\ntailstate_oversized_writes_rejected_total %d\n", storage.DatabaseBytes, storage.DatabaseLimitBytes, storage.PressureRatio(), storage.DatabaseEnforcedLimitBytes, boolMetric(storage.LimitEnforced()), storage.DatabaseFileBytes, storage.DatabaseWALBytes, storage.DatabaseSHMBytes, storage.DatabasePhysicalBytes, storage.SnapshotTruncations, storage.EventValueTruncations, storage.HistoryPageTruncations, storage.OversizedWritesRejected)
-	fmt.Fprintf(w, "# TYPE tailstate_snapshot_limit_bytes gauge\ntailstate_snapshot_limit_bytes %d\n# TYPE tailstate_event_value_limit_bytes gauge\ntailstate_event_value_limit_bytes %d\n# TYPE tailstate_history_page_limit_bytes gauge\ntailstate_history_page_limit_bytes %d\n# TYPE tailstate_reject_limit_bytes gauge\ntailstate_reject_limit_bytes %d\n", limits.SnapshotBytes, limits.EventValueBytes, limits.HistoryPageBytes, limits.RejectBytes)
-	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
-	paused := 0
-	if status.Configured && status.EnabledDestinations == 0 {
-		paused = 1
-	}
-	fmt.Fprintf(w, "# TYPE tailstate_notification_destinations gauge\ntailstate_notification_destinations %d\n# TYPE tailstate_notification_destinations_enabled gauge\ntailstate_notification_destinations_enabled %d\n# TYPE tailstate_notifications_paused gauge\ntailstate_notifications_paused %d\n", status.Destinations, status.EnabledDestinations, paused)
-	fmt.Fprint(w, "# TYPE tailstate_collector_supported gauge\n# TYPE tailstate_collector_baseline gauge\n# TYPE tailstate_collector_partial gauge\n# TYPE tailstate_collector_partial_errors gauge\n# TYPE tailstate_collector_failures gauge\n# TYPE tailstate_collector_poll_duration_seconds gauge\n# TYPE tailstate_collector_last_success_timestamp_seconds gauge\n# TYPE tailstate_collector_next_poll_timestamp_seconds gauge\n")
-	for _, collector := range status.Collectors {
-		supported, baseline := 0, 0
-		if collector.Supported {
-			supported = 1
-		}
-		if collector.Baseline {
-			baseline = 1
-		}
-		partial := 0
-		if collector.Partial {
-			partial = 1
-		}
-		fmt.Fprintf(w, "tailstate_collector_supported{collector=%q} %d\ntailstate_collector_baseline{collector=%q} %d\ntailstate_collector_partial{collector=%q} %d\ntailstate_collector_partial_errors{collector=%q} %d\ntailstate_collector_failures{collector=%q} %d\ntailstate_collector_poll_duration_seconds{collector=%q} %.3f\n", collector.Name, supported, collector.Name, baseline, collector.Name, partial, collector.Name, collector.PartialErrorCount, collector.Name, collector.FailureCount, collector.Name, float64(collector.PollDurationMS)/1000)
-		if collector.LastSuccess != nil {
-			fmt.Fprintf(w, "tailstate_collector_last_success_timestamp_seconds{collector=%q} %d\n", collector.Name, collector.LastSuccess.Unix())
-		}
-		if collector.NextPoll != nil {
-			fmt.Fprintf(w, "tailstate_collector_next_poll_timestamp_seconds{collector=%q} %d\n", collector.Name, collector.NextPoll.Unix())
+		metricValue(b, "tailstate_cleanup_runs_total", "counter", "Retention cleanup runs.", cleanup.Runs)
+		metricValue(b, "tailstate_cleanup_failures_total", "counter", "Retention cleanup runs that failed.", cleanup.Failures)
+		metricValue(b, "tailstate_cleanup_remaining", "gauge", "Whether the last cleanup run left work for a further pass.", boolMetric(cleanup.Remaining))
+		metricValue(b, "tailstate_cleanup_remaining_passes_total", "counter", "Cleanup runs that left work for a further pass.", cleanup.RemainingPasses)
+		metricValue(b, "tailstate_cleanup_transactions_total", "counter", "Cleanup transactions committed.", cleanup.Transactions)
+		metricFamily(b, "tailstate_cleanup_duration_seconds", "summary", "Retention cleanup run duration.")
+		fmt.Fprintf(b, "tailstate_cleanup_duration_seconds_sum %.6f\ntailstate_cleanup_duration_seconds_count %d\n", cleanup.DurationSeconds, cleanup.Runs)
+		metricFamily(b, "tailstate_cleanup_rows_total", "counter", "Rows removed or dead-lettered by retention cleanup, by table.")
+		for _, row := range []struct {
+			table string
+			count uint64
+		}{
+			{"sessions", cleanup.SessionsDeleted},
+			{"auth_tokens", cleanup.AuthTokensDeleted},
+			{"meta", cleanup.MetaDeleted},
+			{"outbox_dead_letter", cleanup.OutboxDeadLettered},
+			{"webhook_dead_letter", cleanup.WebhookDeadLettered},
+			{"events", cleanup.EventsDeleted},
+			{"event_batches", cleanup.EventBatchesDeleted},
+			{"event_batch_triggers", cleanup.EventBatchTriggersDeleted},
+			{"webhook_triggers", cleanup.WebhookTriggersDeleted},
+			{"delivered_outbox", cleanup.DeliveredOutboxDeleted},
+			{"dead_outbox", cleanup.DeadOutboxDeleted},
+		} {
+			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}
 	}
-	for collector, count := range status.ResourceCounts {
-		fmt.Fprintf(w, "tailstate_resources{collector=%q} %d\n", collector, count)
+	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes used by the SQLite database.", storage.DatabaseBytes)
+	metricValue(b, "tailstate_storage_limit_bytes", "gauge", "Configured database budget.", storage.DatabaseLimitBytes)
+	metricValue(b, "tailstate_storage_pressure_ratio", "gauge", "Database bytes divided by the configured budget.", storage.PressureRatio())
+	metricValue(b, "tailstate_storage_enforced_limit_bytes", "gauge", "Page ceiling SQLite enforces on the active connection.", storage.DatabaseEnforcedLimitBytes)
+	metricValue(b, "tailstate_storage_limit_enforced", "gauge", "Whether the enforced page ceiling is within the configured database budget.", boolMetric(storage.LimitEnforced()))
+	metricValue(b, "tailstate_storage_database_file_bytes", "gauge", "Physical bytes used by the main SQLite database file.", storage.DatabaseFileBytes)
+	metricValue(b, "tailstate_storage_wal_bytes", "gauge", "Physical bytes used by the SQLite WAL sidecar.", storage.DatabaseWALBytes)
+	metricValue(b, "tailstate_storage_shm_bytes", "gauge", "Physical bytes used by the SQLite shared-memory sidecar.", storage.DatabaseSHMBytes)
+	metricValue(b, "tailstate_storage_physical_bytes", "gauge", "Total physical bytes used by the SQLite database and sidecars.", storage.DatabasePhysicalBytes)
+	metricValue(b, "tailstate_snapshot_truncations_total", "counter", "Snapshots stored as a truncation marker.", storage.SnapshotTruncations)
+	metricValue(b, "tailstate_event_value_truncations_total", "counter", "Event values stored as a truncation marker.", storage.EventValueTruncations)
+	metricValue(b, "tailstate_history_page_truncations_total", "counter", "History pages truncated at the page byte limit.", storage.HistoryPageTruncations)
+	metricValue(b, "tailstate_oversized_writes_rejected_total", "counter", "Oversized raw writes replaced by a metadata marker.", storage.OversizedWritesRejected)
+	metricValue(b, "tailstate_snapshot_limit_bytes", "gauge", "Configured per-snapshot byte limit.", limits.SnapshotBytes)
+	metricValue(b, "tailstate_event_value_limit_bytes", "gauge", "Configured per-event-value byte limit.", limits.EventValueBytes)
+	metricValue(b, "tailstate_history_page_limit_bytes", "gauge", "Configured history page byte limit.", limits.HistoryPageBytes)
+	metricValue(b, "tailstate_reject_limit_bytes", "gauge", "Configured raw-write rejection byte limit.", limits.RejectBytes)
+	metricValue(b, "tailstate_webhook_triggers_pending", "gauge", "Verified webhook deliveries waiting for reconciliation.", status.WebhookPending)
+	metricValue(b, "tailstate_webhook_triggers_processing", "gauge", "Verified webhook deliveries currently being reconciled.", status.WebhookProcessing)
+	metricValue(b, "tailstate_webhook_triggers_dead", "gauge", "Verified webhook deliveries that exhausted their retry window.", status.WebhookDead)
+	metricFamily(b, "tailstate_webhook_requests_total", "counter", "Tailscale webhook requests by outcome; content_fallback is an authentic delivery outside TailState's bounds that requested a full reconciliation.")
+	for _, outcome := range webhookOutcomes {
+		fmt.Fprintf(b, "tailstate_webhook_requests_total{outcome=%q} %d\n", outcome, s.webhookOutcomeCount(outcome))
+	}
+	state := diagnostics.NotificationStateFor(status.Configured, status.Destinations, status.EnabledDestinations)
+	metricValue(b, "tailstate_notification_destinations", "gauge", "Notification destinations configured.", status.Destinations)
+	metricValue(b, "tailstate_notification_destinations_enabled", "gauge", "Notification destinations enabled.", status.EnabledDestinations)
+	metricValue(b, "tailstate_notifications_paused", "gauge", "Whether a configured installation is not delivering notifications (no destination, or every destination disabled).", boolMetric(state.Paused()))
+	metricFamily(b, "tailstate_notification_state", "gauge", "Notification delivery state; exactly one state is 1.")
+	for _, candidate := range diagnostics.NotificationStates {
+		fmt.Fprintf(b, "tailstate_notification_state{state=%q} %d\n", candidate, boolMetric(candidate == state))
+	}
+	collectorFamilies := []struct{ name, help string }{
+		{"tailstate_collector_supported", "Whether the collector is supported by the tailnet and credentials."},
+		{"tailstate_collector_baseline", "Whether the collector has a baseline."},
+		{"tailstate_collector_partial", "Whether the collector's last result was partial."},
+		{"tailstate_collector_partial_errors", "Failed related requests in the collector's last partial result."},
+		{"tailstate_collector_failures", "Consecutive collector failures."},
+		{"tailstate_collector_poll_duration_seconds", "Duration of the collector's last poll."},
+		{"tailstate_collector_last_success_timestamp_seconds", "Unix time of the collector's last successful poll."},
+		{"tailstate_collector_next_poll_timestamp_seconds", "Unix time of the collector's next scheduled poll."},
+	}
+	for index, family := range collectorFamilies {
+		metricFamily(b, family.name, "gauge", family.help)
+		for _, collector := range status.Collectors {
+			switch index {
+			case 0:
+				fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, boolMetric(collector.Supported))
+			case 1:
+				fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, boolMetric(collector.Baseline))
+			case 2:
+				fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, boolMetric(collector.Partial))
+			case 3:
+				fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, collector.PartialErrorCount)
+			case 4:
+				fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, collector.FailureCount)
+			case 5:
+				fmt.Fprintf(b, "%s{collector=%q} %.3f\n", family.name, collector.Name, float64(collector.PollDurationMS)/1000)
+			case 6:
+				if collector.LastSuccess != nil {
+					fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, collector.LastSuccess.Unix())
+				}
+			case 7:
+				if collector.NextPoll != nil {
+					fmt.Fprintf(b, "%s{collector=%q} %d\n", family.name, collector.Name, collector.NextPoll.Unix())
+				}
+			}
+		}
+	}
+	metricFamily(b, "tailstate_resources", "gauge", "Resources in the current baseline, by collector.")
+	collectors := make([]string, 0, len(status.ResourceCounts))
+	for collector := range status.ResourceCounts {
+		collectors = append(collectors, collector)
+	}
+	sort.Strings(collectors)
+	for _, collector := range collectors {
+		fmt.Fprintf(b, "tailstate_resources{collector=%q} %d\n", collector, status.ResourceCounts[collector])
 	}
 }
 
@@ -1075,47 +1346,98 @@ func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) 
 	cookie, _ := r.Cookie("tailstate_csrf")
 	return cookie.Value, true
 }
-func (s *Server) rateLimited(ip string) bool {
+
+// throttleKey returns the per-client limiter bucket for action. IPv6 clients
+// are aggregated by their /64, which a single host or customer site usually
+// controls in full; IPv4 (including IPv4-mapped IPv6) keeps one bucket per
+// address.
+func (s *Server) throttleKey(action credentialAction, client string) string {
+	return string(action) + ":" + limiterAddress(client)
+}
+
+func limiterAddress(client string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(client))
+	if err != nil {
+		return client
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is4() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(loginIPv6PrefixBits)
+	if err != nil {
+		return addr.String()
+	}
+	return prefix.String()
+}
+
+// throttled reports whether a credential submission must be refused, and for
+// how long. Two independent limits apply: each client bucket allows
+// loginFailuresPerClient failures per loginFailureWindow, and every action has
+// a global failure budget across all sources. Once the global budget is spent,
+// each further failure doubles the wait (capped at loginGlobalBackoffMax), so
+// distributed guessing slows down exponentially instead of being bounded only
+// by the password hash cost.
+func (s *Server) throttled(action credentialAction, key string) (time.Duration, bool) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	now := time.Now()
-	cutoff := now.Add(-15 * time.Minute)
-	s.pruneLoginAttemptsLocked(cutoff)
-	attempts, exists := s.loginAttempts[ip]
-	if !exists {
-		return false
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
+	var retry time.Duration
+	if attempts := s.loginAttempts[key]; len(attempts) >= loginFailuresPerClient {
+		// The bucket reopens when its oldest counted failure leaves the window.
+		retry = attempts[len(attempts)-loginFailuresPerClient].Add(loginFailureWindow).Sub(now)
 	}
-	kept := attempts[:0]
-	for _, at := range attempts {
-		if at.After(cutoff) {
-			kept = append(kept, at)
+	if global := s.globalFailures[action]; len(global) >= loginGlobalFailureBudget {
+		until := global[len(global)-1].Add(globalBackoff(len(global) - loginGlobalFailureBudget))
+		if wait := until.Sub(now); wait > retry {
+			retry = wait
 		}
 	}
-	if len(kept) == 0 {
-		delete(s.loginAttempts, ip)
-	} else {
-		s.loginAttempts[ip] = kept
-	}
-	return len(kept) >= 5
+	return retry, retry > 0
 }
-func (s *Server) recordFailure(ip string) {
+
+// globalBackoff returns the delay after the excess-th failure beyond the
+// global budget: 1s, 2s, 4s, ... capped at loginGlobalBackoffMax.
+func globalBackoff(excess int) time.Duration {
+	if excess > 16 {
+		excess = 16
+	}
+	delay := loginGlobalBackoffBase << excess
+	if delay > loginGlobalBackoffMax {
+		delay = loginGlobalBackoffMax
+	}
+	return delay
+}
+
+func (s *Server) recordFailure(action credentialAction, key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	now := time.Now()
-	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
-	s.loginAttempts[ip] = append(s.loginAttempts[ip], now)
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
+	s.loginAttempts[key] = append(s.loginAttempts[key], now)
+	global := append(s.globalFailures[action], now)
+	// Beyond the budget only the count up to the backoff cap matters.
+	if limit := loginGlobalFailureBudget + 17; len(global) > limit {
+		global = append(global[:0:0], global[len(global)-limit:]...)
+	}
+	s.globalFailures[action] = global
 	// Keep the map bounded even when this is called without a preceding
-	// rateLimited check (for example, from a future authentication flow).
-	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
+	// throttled check (for example, from a future authentication flow).
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
 }
-func (s *Server) clearFailures(ip string) {
+
+// clearFailures resets one client bucket after a successful submission. The
+// global budget is deliberately left alone: it measures failures from every
+// source and must not be reset by the success it is protecting.
+func (s *Server) clearFailures(key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	delete(s.loginAttempts, ip)
+	delete(s.loginAttempts, key)
 }
 
 func (s *Server) pruneLoginAttemptsLocked(cutoff time.Time) {
-	for ip, attempts := range s.loginAttempts {
+	for key, attempts := range s.loginAttempts {
 		kept := attempts[:0]
 		for _, at := range attempts {
 			if at.After(cutoff) {
@@ -1123,23 +1445,49 @@ func (s *Server) pruneLoginAttemptsLocked(cutoff time.Time) {
 			}
 		}
 		if len(kept) == 0 {
-			delete(s.loginAttempts, ip)
+			delete(s.loginAttempts, key)
 			continue
 		}
-		s.loginAttempts[ip] = kept
+		s.loginAttempts[key] = kept
 	}
 	for len(s.loginAttempts) > maxTrackedLoginIPs {
-		var oldestIP string
+		var oldestKey string
 		var oldest time.Time
-		for ip, attempts := range s.loginAttempts {
+		for key, attempts := range s.loginAttempts {
 			candidate := attempts[0]
-			if oldestIP == "" || candidate.Before(oldest) {
-				oldestIP, oldest = ip, candidate
+			if oldestKey == "" || candidate.Before(oldest) {
+				oldestKey, oldest = key, candidate
 			}
 		}
-		delete(s.loginAttempts, oldestIP)
+		delete(s.loginAttempts, oldestKey)
+	}
+	for action, failures := range s.globalFailures {
+		kept := failures[:0]
+		for _, at := range failures {
+			if at.After(cutoff) {
+				kept = append(kept, at)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.globalFailures, action)
+			continue
+		}
+		s.globalFailures[action] = kept
 	}
 }
+
+// renderThrottled answers a throttled credential submission with 429 and a
+// Retry-After header (whole seconds, rounded up) while still rendering the
+// form so a browser user sees the reason.
+func (s *Server) renderThrottled(w http.ResponseWriter, r *http.Request, name string, action credentialAction, message string, retry time.Duration) {
+	seconds := int64((retry + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	s.renderCredentialStatus(w, r, name, action, pageData{Error: message}, http.StatusTooManyRequests)
+}
+
 func remoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

@@ -68,9 +68,11 @@ After claiming the installation, the authenticated Settings page asks for:
 1. Tailnet (`-` uses the OAuth credential's tailnet).
 2. OAuth client ID and secret with `all:read`.
 3. At least one notification destination using a Shoutrrr URL.
-4. Device and secondary inventory polling intervals.
+4. Device and secondary inventory polling intervals, in whole seconds. Device
+   polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
+   accepts 30 seconds to 24 hours.
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 
@@ -95,6 +97,25 @@ event types trigger a complete reconciliation. The normal TailState poll
 interval remains the fallback if the endpoint is unavailable; accepted webhook
 triggers are never lost between the HTTP response and reconciliation.
 
+Once the signature is valid the delivery is authentic, so content outside
+TailState's own bounds (more than 100 events, an empty batch, or an event type
+that is missing, longer than 128 bytes, or contains control characters) is
+still recorded with capped metadata, answered with `202`, and queued as a
+complete reconciliation rather than dropped. Response codes are:
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Accepted (or a duplicate of an accepted body); the JSON body reports `"reconciliation": "targeted"` or `"full"` |
+| `400` | Empty body, or a correctly signed body that is not a JSON event array |
+| `401` | Missing or invalid signature, or a timestamp outside the accepted window |
+| `404` | No webhook secret is configured |
+| `413` | Body larger than 1 MiB |
+
+`tailstate_webhook_requests_total{outcome=...}` counts `accepted`,
+`content_fallback`, `duplicate`, `invalid_signature`, `malformed`, `too_large`,
+`not_configured`, and `unavailable` separately, so a burst that fell back to a
+full reconciliation is never mistaken for a signature problem.
+
 Shoutrrr supports Mattermost natively, for example:
 
 ```text
@@ -111,7 +132,9 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts (plus a paused gauge when every destination is disabled), pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
+Only the documented routes exist: `/` redirects to the right page, unknown paths return `404`, `/static/` serves the embedded stylesheet without directory listings, and the browser's automatic `/favicon.ico` probe gets an empty, cacheable `204` without touching the database.
+
+`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
 
 Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention.
 
@@ -186,11 +209,27 @@ firewall and TLS-terminating proxy already restrict access to the host port.
 Setup, login, and password-reset forms do not reject requests based on
 `Origin`, `Referer`, or Fetch Metadata headers because reverse proxies can
 rewrite those values. Each credential form also carries an action-bound,
-single-use challenge in a `SameSite=Strict` cookie and a signed hidden field.
-Challenges expire after five minutes and are invalidated when TailState
-restarts; reload the page if a challenge expires or a bookmarked form was
-opened before a restart. Setup and reset still require one-time tokens, login
-is rate limited, and authenticated state-changing forms require CSRF tokens.
+single-use challenge: a signed hidden field bound to a signed per-browser
+`SameSite=Strict` cookie. Issuing a form keeps no server-side state, so
+unauthenticated page loads cannot evict a pending form, and several tabs in the
+same browser can each submit their own form. Only submitted challenges are
+remembered (until they expire) so they cannot be replayed. Challenges expire
+after five minutes and are invalidated when TailState restarts; reload the page
+if a challenge expires or a bookmarked form was opened before a restart. Setup
+and reset still require one-time tokens, and authenticated state-changing forms
+require CSRF tokens.
+
+Setup, login, and reset submissions are throttled. Each client may fail five
+times per action in 15 minutes; IPv6 clients are grouped by their /64 network
+because one host can usually use any address in it, while IPv4 clients are
+tracked per address. Independently, each action has a global budget of 30
+failures per 15 minutes from any mix of sources; beyond it every further
+failure doubles the wait (1 s, 2 s, 4 s, ... up to five minutes). A throttled
+submission receives `429 Too Many Requests` with a `Retry-After` header (in
+seconds) and the form explains the delay. Behind a reverse proxy, list the
+proxy in `TAILSTATE_TRUSTED_PROXIES` so clients are throttled individually;
+otherwise every user shares the proxy's bucket, and the Settings diagnostics
+report `untrusted_forwarded_headers`.
 Challenge and credential failures are exposed only through low-cardinality
 route/outcome metrics; secrets, tokens, cookies, and request headers are never
 logged.
@@ -216,7 +255,16 @@ docker compose exec tailstate /tailstate doctor -json
 ```
 
 The report checks the effective listener, secure-cookie and trusted-proxy
-pairing, setup/baseline state, and whether notifications are paused. The
+pairing, setup/baseline state, and whether notifications are paused
+(`notifications_paused` when every destination is disabled,
+`notifications_no_destinations` when monitoring is configured but no
+destination exists). The Settings banner, these findings, and `/metrics` use
+one shared rule, so they always agree. In the official image
+(`TAILSTATE_CONTAINER=1`, set by the Dockerfile and `compose.yaml`) the
+wildcard container listener is reported as the informational
+`container_listener` finding instead of a warning, because Docker port
+publishing (loopback by default) decides who can reach it; a default Compose
+deployment therefore reports `ok`. The
 authenticated Settings page shows the same checks plus the sanitized origin
 seen for the current request. Raw headers, credentials, and destination URLs
 are never included in reports. `doctor` is strictly read-only: it does not
@@ -238,6 +286,14 @@ docker compose exec tailstate /tailstate admin reset
 Then open `/reset`. Resetting the password invalidates existing sessions and any
 outstanding reset token. Reset tokens expire after 30 minutes; generate another
 token if one expires.
+
+`admin reset` is safe to run while the service is serving: it opens the
+existing database without bootstrap DDL, migrations, backfills, or storage
+limit writes, writes only the reset token, and waits for the service's write
+lock instead of failing with `database is locked`. It never creates a database
+(a mistyped `TAILSTATE_DATA_DIR` fails with "database not found") and refuses a
+database whose schema is not the current version; start the current release
+once, after a verified backup, to migrate it first.
 
 ### Master-key rotation
 
@@ -333,13 +389,13 @@ in a disposable project before relying on the procedure for an outage.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
-- Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`.
+- Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`. `evidence public-key` opens the database read-only and fails if the database, the current schema, or the stored signing key is missing; it never creates a database or a new key.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
 - Delivery failures are classified from the HTTP response TailState's transport actually received, never from provider error text (so a port such as `:443` or an SMTP code is not mistaken for an HTTP status). Connection failures are recorded as "failed" or "timed out". HTTP 400, 401, 403, and 404 dead-letter on the first attempt as "notification rejected by provider (HTTP *n*)", because a malformed request, revoked token, or deleted webhook cannot succeed on retry. Other statuses (for example 429 and 5xx) are retried; a provider's `Retry-After` header (seconds or HTTP date) sets the next attempt, capped at one hour.
 - Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a gateway retry that would not fit in that window reports the upstream status immediately. Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
-- If every destination is disabled, monitoring continues and notifications are reported as paused.
+- If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
 - A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
@@ -448,6 +504,7 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
+| `TAILSTATE_CONTAINER` | `false` (`1` in the image) | Marks the official container image; its wildcard listener is then an informational diagnostic |
 | `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |
 | `TAILSTATE_EVENT_VALUE_LIMIT_BYTES` | `524288` | Maximum before/after value retained per history event; `0` uses the default |
 | `TAILSTATE_HISTORY_PAGE_LIMIT_BYTES` | `2097152` | Maximum stored event data read for one History page; `0` uses the default |
@@ -457,7 +514,9 @@ the optional webhook secret are entered in the authenticated UI.
 The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
 
 Standalone binaries bind the authenticated UI to loopback by default. If you
-explicitly bind a plaintext listener beyond loopback, TailState logs a warning;
+explicitly bind a plaintext listener beyond loopback, TailState logs a warning
+(inside the official image, the default wildcard listener is logged at info
+level because the published port controls exposure);
 use `TAILSTATE_COOKIE_SECURE=true` and a configured trusted HTTPS proxy for
 remote access. Compose keeps the application listener on the private container
 network and publishes it on loopback by default.

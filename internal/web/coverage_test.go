@@ -367,14 +367,14 @@ func TestLoginLogoutAndResetBranches(t *testing.T) {
 	cookies := correct.Result().Cookies()
 	ip := "192.0.2.1"
 	for i := 0; i < 5; i++ {
-		server.recordFailure(ip)
+		server.recordFailure(credentialActionLogin, server.throttleKey(credentialActionLogin, ip))
 	}
 	rateLimited := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("password=wrong"))
 	rateLimited.RemoteAddr = ip + ":1234"
 	rateLimited.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rateLimitedResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rateLimitedResponse, rateLimited)
-	if rateLimitedResponse.Code != http.StatusOK || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
+	if rateLimitedResponse.Code != http.StatusTooManyRequests || rateLimitedResponse.Header().Get("Retry-After") == "" || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
 		t.Fatalf("rate limited login response %d: %s", rateLimitedResponse.Code, rateLimitedResponse.Body.String())
 	}
 
@@ -485,7 +485,7 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 
 	badIntervals := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "device_interval": {"not-a-number"}, "inventory_interval": {"300"}}
 	badResponse := coveragePost(t, server, "/settings", badIntervals, cookies)
-	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Poll intervals must be whole seconds") {
+	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Device poll interval must be a whole number of seconds") {
 		t.Fatalf("invalid settings response %d: %s", badResponse.Code, badResponse.Body.String())
 	}
 	validSettings := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "webhook_secret": {"webhook-secret"}, "device_interval": {"60"}, "inventory_interval": {"300"}}
@@ -766,7 +766,7 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	webhookBody.Body = webFailingBody{}
 	webhookResponse := httptest.NewRecorder()
 	server.tailscaleWebhook(webhookResponse, webhookBody)
-	if webhookResponse.Code != http.StatusRequestEntityTooLarge {
+	if webhookResponse.Code != http.StatusBadRequest {
 		t.Fatalf("failing webhook body status=%d body=%s", webhookResponse.Code, webhookResponse.Body.String())
 	}
 	if err := st.Close(); err != nil {
@@ -1001,7 +1001,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 		t.Fatalf("authenticated status did not explain partial collector errors: status=%d body=%s", authStatus.Code, authStatus.Body.String())
 	}
 	server.loginAttempts["stale"] = []time.Time{time.Now().Add(-16 * time.Minute)}
-	if server.rateLimited("stale") {
+	if _, limited := server.throttled(credentialActionLogin, "stale"); limited {
 		t.Fatal("stale login attempts were rate limited")
 	}
 	if _, ok := server.loginAttempts["stale"]; ok {
@@ -1132,7 +1132,7 @@ func TestWebOperationalFailureBranches(t *testing.T) {
 	server, st, _, _ := webServerWithDatabase(t)
 	defer st.Close()
 	server.loginAttempts["recent"] = []time.Time{time.Now()}
-	if server.rateLimited("recent") {
+	if _, limited := server.throttled(credentialActionLogin, "recent"); limited {
 		t.Fatal("a single recent login attempt was rate limited")
 	}
 	if len(server.loginAttempts["recent"]) != 1 {
