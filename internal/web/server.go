@@ -320,18 +320,44 @@ func favicon(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// Serve binds the configured listener and serves until ctx is canceled.
 func (s *Server) Serve(ctx context.Context) error {
+	listener, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.ServeListener(ctx, listener)
+}
+
+// Listen binds the configured address without serving it. The serve command
+// binds before it starts the monitor engine, so an address conflict stops
+// startup before any collector poll or notification delivery.
+func (s *Server) Listen() (net.Listener, error) {
+	listener, err := net.Listen("tcp", s.config.ListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", s.config.ListenAddr, err)
+	}
+	return listener, nil
+}
+
+// ServeListener serves an already bound listener until ctx is canceled and
+// closes the listener on return.
+func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error {
 	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: serverWriteTimeout, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("TailState web server listening", "address", s.config.ListenAddr)
-		errCh <- server.ListenAndServe()
+		slog.Info("TailState web server listening", "address", listener.Addr().String())
+		errCh <- server.Serve(listener)
 	}()
 	select {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return server.Shutdown(shutdown)
+		err := server.Shutdown(shutdown)
+		// Serve returns ErrServerClosed once Shutdown has closed the
+		// listener; drain it so the goroutine never outlives the call.
+		<-errCh
+		return err
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -696,13 +722,14 @@ func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Reque
 // expiringSoon lists device node keys and auth keys that expire within the
 // widest configured warning window, using the same filters as the warnings.
 // A read failure only hides the card; it never fails the status page.
+// Every read uses the store's read-only pool.
 func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringResource, int, bool) {
-	settings, err := s.store.Settings(ctx)
+	settings, err := s.store.ExpiryOptions(ctx)
 	if err != nil {
 		return nil, expiry.DefaultHorizonDays, false
 	}
-	horizon := expiry.HorizonDays(settings.ExpiryWarningDays)
-	filtered := len(settings.ExpiryTagFilter) > 0
+	horizon := expiry.HorizonDays(settings.WarningDays)
+	filtered := len(settings.TagFilter) > 0
 	devices, err := s.store.CollectorSnapshots(ctx, settings.Generation, "devices")
 	if err != nil {
 		slog.Error("load device snapshots for expiry card", "error", err)
@@ -713,7 +740,7 @@ func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringRes
 		slog.Error("load key snapshots for expiry card", "error", err)
 		return nil, horizon, filtered
 	}
-	items := expiry.Upcoming(expiry.Items(expirySnapshots(devices), expirySnapshots(keys), settings.ExpiryTagFilter), now, horizon)
+	items := expiry.Upcoming(expiry.Items(expirySnapshots(devices), expirySnapshots(keys), settings.TagFilter), now, horizon)
 	out := make([]expiringResource, 0, len(items))
 	for _, item := range items {
 		out = append(out, expiringResource{Kind: item.KindLabel(), Name: item.Name, Tags: strings.Join(item.Tags, ", "), Expires: item.Expires, DaysLeft: item.DaysLeft(now)})
@@ -1205,6 +1232,9 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 			RejectLimitBytes:        limits.RejectBytes,
 			DatabaseLimitBytes:      metrics.DatabaseLimitBytes,
 			DatabaseBytes:           metrics.DatabaseBytes,
+			DatabaseUsedBytes:       metrics.DatabaseUsedBytes,
+			DatabaseFreelistPages:   metrics.DatabaseFreelistPages,
+			DatabaseFreeBytes:       metrics.DatabaseFreeBytes,
 			DatabaseFileBytes:       metrics.DatabaseFileBytes,
 			DatabaseWALBytes:        metrics.DatabaseWALBytes,
 			DatabaseSHMBytes:        metrics.DatabaseSHMBytes,
@@ -1748,9 +1778,12 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}
 	}
-	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes used by the SQLite database.", storage.DatabaseBytes)
+	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes allocated by the SQLite database, including free pages.", storage.DatabaseBytes)
+	metricValue(b, "tailstate_storage_used_bytes", "gauge", "Logical bytes in use by the SQLite database, excluding free pages.", storage.DatabaseUsedBytes)
+	metricValue(b, "tailstate_storage_freelist_pages", "gauge", "Free SQLite pages awaiting reuse or compaction.", storage.DatabaseFreelistPages)
+	metricValue(b, "tailstate_storage_free_bytes", "gauge", "Bytes held by free SQLite pages.", storage.DatabaseFreeBytes)
 	metricValue(b, "tailstate_storage_limit_bytes", "gauge", "Configured database budget.", storage.DatabaseLimitBytes)
-	metricValue(b, "tailstate_storage_pressure_ratio", "gauge", "Database bytes divided by the configured budget.", storage.PressureRatio())
+	metricValue(b, "tailstate_storage_pressure_ratio", "gauge", "Used database bytes (excluding free pages) divided by the configured budget.", storage.PressureRatio())
 	metricValue(b, "tailstate_storage_enforced_limit_bytes", "gauge", "Page ceiling SQLite enforces on the active connection.", storage.DatabaseEnforcedLimitBytes)
 	metricValue(b, "tailstate_storage_limit_enforced", "gauge", "Whether the enforced page ceiling is within the configured database budget.", boolMetric(storage.LimitEnforced()))
 	metricValue(b, "tailstate_storage_database_file_bytes", "gauge", "Physical bytes used by the main SQLite database file.", storage.DatabaseFileBytes)
