@@ -206,14 +206,18 @@ func (e *Engine) takeTriggerOverflow() []ReconcileRequest {
 	return out
 }
 
-// Run starts the scheduler, delivery worker, and retention worker. Wait must
+// Run starts the scheduler, delivery worker, expiry worker, and retention worker. Wait must
 // be called after the context is cancelled when the owning process is shutting
 // down so the store is not closed while a worker is still writing to it.
 func (e *Engine) Run(ctx context.Context) {
-	e.wg.Add(3)
+	e.wg.Add(4)
 	go func() {
 		defer e.wg.Done()
 		e.scheduler(ctx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.expiryWorker(ctx)
 	}()
 	go func() {
 		defer e.wg.Done()
@@ -347,7 +351,7 @@ func (e *Engine) scheduler(ctx context.Context) {
 			generation = current.Generation
 			settingsRevision = currentRevision
 			settings = current
-			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret})
+			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret, Scopes: settings.OAuthScopes})
 			if identityChanged {
 				initialSuccess := e.poll(ctx, client, settings, allCollectors(), false)
 				stop(deviceTimer)
@@ -562,7 +566,8 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		if err != nil && tailscale.IsUnsupportedCollector(collector, err) {
 			result.Error = nil
 			result.Unsupported = true
-			slog.Info("collector unsupported", "collector", collector)
+			result.UnsupportedReason = tailscale.UnsupportedReason(err)
+			slog.Info("collector unsupported", "collector", collector, "reason", result.UnsupportedReason)
 		} else if err != nil {
 			success = false
 			collectorSuccess = false

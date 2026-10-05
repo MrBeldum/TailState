@@ -10,9 +10,12 @@ of truth and the safety net for missed events.
 
 - Devices, stable tailnet IPv4/IPv6 addresses, details, authorization, tags, key expiry, client version, routes, posture attributes, and invites.
 - Users (members and shared/external users, collected with `type=all`) and user invites. Shared users that already existed when upgrading from a version that collected members only are absorbed silently into the existing baseline on the first poll after the upgrade; a user shared after that is reported as created.
-- DNS nameservers, preferences, search paths, and split DNS.
+- DNS configuration from `dns/configuration`: nameservers, split DNS, search paths, MagicDNS and override-local-DNS preferences, and each resolver's `useWithExitNode` flag. If that endpoint returns `404`, TailState falls back to the four legacy DNS endpoints.
+- Tailscale Services (`services`): each service's name, display name, addresses, ports, tags, and comment.
+- OAuth apps (`oauth_apps`): name, description, redirect URIs, granted scopes, and allowed node attributes (never the client secret or timestamps).
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
+- Upcoming expiry of device node keys and auth keys: a daily check warns before they expire (see [Expiry warnings](#expiry-warnings)).
 
 The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications. What is ignored depends on the collector:
 
@@ -30,7 +33,7 @@ Because the last group has an open schema, a field that Tailscale adds to its AP
 
 ## Quick start
 
-Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read`.
+Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read` (or the narrower read scopes listed in [OAuth scopes](#oauth-scopes)).
 
 First, create the local environment file and encryption key:
 
@@ -78,15 +81,99 @@ The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http
 After claiming the installation, the authenticated Settings page asks for:
 
 1. Tailnet (`-` uses the OAuth credential's tailnet).
-2. OAuth client ID and secret with `all:read`.
+2. OAuth client ID and secret, and the OAuth scopes to request (default
+   `all:read`; see [OAuth scopes](#oauth-scopes)).
 3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals, in whole seconds. Device
    polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
    accepts 30 seconds to 24 hours.
+5. Optional expiry warning windows (default `14, 3` days) and an expiry tag
+   filter; see [Expiry warnings](#expiry-warnings).
 
 Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
+
+### OAuth scopes
+
+TailState requests `all:read` by default. To run with a least-privilege OAuth
+client, grant it only the read scopes for the collectors you want and list the
+same scopes (space- or comma-separated) in **OAuth scopes** on the Settings
+page. Only read scopes (ending in `:read`) are accepted; TailState never
+requests a write scope.
+
+| Collector | Read scope |
+| --- | --- |
+| `devices` (required; also used by the settings test) | `devices:core:read` |
+| `device_details` | `devices:posture_attributes:read`, `device_invites:read` |
+| `users` | `users:read` |
+| `user_invites` | `user_invites:read` |
+| `dns` | `dns:read` |
+| `policy` | `policy_file:read` |
+| `keys` | `auth_keys:read`; add `api_access_tokens:read`, `oauth_keys:read`, and `federated_keys:read` to see those credential types |
+| `webhooks` | `webhooks:read` |
+| `log_streaming` | `log_streaming:read` |
+| `contacts` | `account_settings:read` |
+| `posture` | `feature_settings:read` |
+| `settings` | `feature_settings:read`; some fields also need `logs:network:read`, `networking_settings:read`, or `policy_file:read` |
+| `services` | `services:read` |
+| `oauth_apps` | `oauth_apps:read` |
+
+A collector whose endpoint answers `403` is shown on the status page as
+**Unsupported** with the label "insufficient OAuth scope or plan (HTTP 403)"
+(Tailscale uses the same status for a missing scope and a plan without the
+feature); a `404` is labelled "not available for this tailnet". Without
+`devices:posture_attributes:read` or `device_invites:read`, the per-device
+detail is recorded as an explicit unsupported value. Unsupported collectors are
+informational and do not degrade readiness. Changing the scopes makes every
+unsupported collector due for an immediate re-check; a collector that becomes
+readable baselines silently. Narrowing scopes can hide resources or fields
+(for example other credential types under `keys`), which are then reported as
+removed or changed, so settle on the scopes before the first baseline.
+
+Per-service hosts and approvals (`/services/{name}/devices` and
+`/services/{name}/device/{id}/approved`) are not collected: Tailscale requires
+the write-capable `services` scope for them.
+
+### Expiry warnings
+
+TailState already stores each device's key expiry and each auth key's expiry,
+but those fields only produce events when they change. A separate daily check
+reads the current snapshots and warns *before* a device node key or auth key
+expires, so a server does not silently drop off the tailnet and automated
+enrolment does not break on an expired auth key.
+
+- **Windows.** Each window is a number of days before expiry (default `14` and
+  `3`; at most four windows between 1 and 365 days). Leave the field blank on
+  the Settings page to disable warnings.
+- **One grouped notification per window.** Every resource that newly entered a
+  window is listed in one system notification for that window, with its name,
+  tags, and expiry. A resource inside several windows at once is reported once,
+  in the tightest window.
+- **Each resource and window alerts once.** The warning state lives in the
+  existing `meta` table (no schema change) and is committed in the same
+  transaction as the notification. When the expiry changes (for example after a
+  device is re-authenticated or an auth key is replaced) the state for that
+  resource resets, so the new expiry is warned about again when it comes close.
+- **Delivered like health alerts.** Expiry warnings are system notifications,
+  not inventory changes: like collector health alerts they reach every enabled
+  destination regardless of routing and mute rules, are rendered in each
+  destination's message format, name the instance and tailnet in the title,
+  carry an `Observed at` line, and link to `/status` when
+  `TAILSTATE_PUBLIC_URL` is set. A long list is shortened at line boundaries
+  with an explicit count of the omitted resources.
+- **Exclusions.** Devices with key expiry disabled, ephemeral devices, revoked
+  or invalid keys, OAuth clients, and short-lived API access tokens are never
+  warned about. Only machine auth keys (`keyType: auth`) are considered.
+- **Tag filter.** Optionally list tags such as `tag:server`; only devices and
+  auth keys carrying one of them (for auth keys, the tags they create devices
+  with) are warned about.
+
+The status page shows an **Expiring soon** card listing everything that expires
+within the widest window (14 days when warnings are disabled), using the same
+exclusions and tag filter. The first check runs two minutes after start-up so
+the first poll can refresh the snapshots; failed checks are retried after 15
+minutes.
 
 ### Faster reconciliation with Tailscale webhooks
 
@@ -395,9 +482,9 @@ in a disposable project before relying on the procedure for an outage.
 - The first complete supported inventory is a silent baseline.
 - Stable additions and modifications alert on the next successful poll.
 - Removals require absence from two complete successful polls.
-- One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift.
+- One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift. A DNS snapshot stored from the legacy endpoints is compared with the `dns/configuration` response only on the fields both express (nameservers, MagicDNS, search paths, split DNS), so the upgrade, and any later fallback between the two endpoints, is silent unless one of those fields actually changed. New collectors (`services`, `oauth_apps`) take a silent baseline on their first successful poll.
 - Failed or partial polls never delete snapshots.
-- Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
+- Single-object endpoints (tailnet settings, contacts, policy, the DNS configuration and each legacy DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 4) include normalized snapshots, field diffs, each event's severity and `muted` flag, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
@@ -409,7 +496,7 @@ in a disposable project before relying on the procedure for an outage.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
 - If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery. Transitions observed in one poll are grouped into one message per destination (one "unhealthy" and later one "recovered"), each collector listed with a bounded reason: `auth rejected`, `rate limited`, `timeout`, `upstream 5xx`, `invalid response`, `unsupported`, or `network error`. Provider error text is never included. A revoked OAuth credential therefore produces one grouped alert per poll schedule (device and inventory collectors are polled on separate schedules) instead of one alert per collector.
-- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
+- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
 - A 403/404 from an optional plan-specific endpoint is treated as an
@@ -446,7 +533,7 @@ collector, and History can be filtered by severity.
 | --- | --- |
 | High | Any `policy`, `log_streaming`, `settings` (tailnet settings), or `webhooks` change; a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
 | Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
-| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, and posture changes |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, `services`, and `oauth_apps` changes |
 
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields
@@ -461,8 +548,8 @@ changes, and a destination whose rules match nothing in a batch receives no
 digest. For example, a paging channel with "high only" receives nothing for a
 batch of client upgrades, while a default destination still receives it.
 Destinations created before routing existed, and new destinations, receive all
-changes. Collector health and release notifications are not inventory changes
-and always reach every enabled destination.
+changes. Collector health, expiry warnings, and release notifications are not
+inventory changes and always reach every enabled destination.
 
 ### Noise controls
 
@@ -585,7 +672,7 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
-| `TAILSTATE_PUBLIC_URL` | empty | External `https://` base URL of this instance (no credentials, query, or fragment). Digests then link to `/history?batch=<id>` and health alerts to `/status`; empty emits no links |
+| `TAILSTATE_PUBLIC_URL` | empty | External `https://` base URL of this instance (no credentials, query, or fragment). Digests then link to `/history?batch=<id>` and health alerts and expiry warnings to `/status`; empty emits no links |
 | `TAILSTATE_INSTANCE_LABEL` | empty | Optional instance name (at most 64 printable bytes) shown in every notification title next to the tailnet |
 | `TAILSTATE_CONTAINER` | `false` (`1` in the image) | Marks the official container image; its wildcard listener is then an informational diagnostic |
 | `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |
