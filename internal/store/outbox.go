@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,22 +13,39 @@ import (
 	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
-const outboxSelect = `SELECT o.id,COALESCE(o.batch_id,0),o.destination_id,o.payload,o.attempts,o.first_attempt,
-		COALESCE(o.lease_until,''),COALESCE(o.lease_token,''),d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,'')
+const outboxSelect = `SELECT o.id,COALESCE(o.batch_id,0),o.destination_id,o.payload,o.payload_format,o.attempts,o.first_attempt,
+		COALESCE(o.lease_until,''),COALESCE(o.lease_token,''),d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,''),d.message_format
 		FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id`
 
 type outboxScanner interface {
 	Scan(dest ...any) error
 }
 
+// EnqueueMessage queues a system notification (health, update) for every
+// enabled destination. The message is stored format-neutral and rendered for
+// each destination's service when it is sent.
+func (s *Store) EnqueueMessage(ctx context.Context, message notify.Message) error {
+	payloadFormat, payload, err := notify.EncodePayload(message)
+	if err != nil {
+		return err
+	}
+	return s.enqueueSystem(ctx, payloadFormat, payload)
+}
+
+// EnqueueSystem queues pre-rendered Markdown for every enabled destination;
+// it is delivered unchanged.
 func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
+	return s.enqueueSystem(ctx, notify.PayloadMarkdown, payload)
+}
+
+func (s *Store) enqueueSystem(ctx context.Context, payloadFormat, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
+	if err := enqueueOutboxTx(ctx, tx, payloadFormat, payload, now, 0); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -73,9 +91,20 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 		WHERE status='pending' AND first_attempt<=?`, nowValue, retryCutoff); err != nil {
 		return nil, err
 	}
+	// Each destination receives its notifications oldest first. A row is
+	// claimable only when every older live row for the same destination is
+	// also claimable: an older row that is backing off after a failure, or
+	// still in flight, holds the destination's younger rows back. Without
+	// this, rows that back off independently would be delivered out of
+	// order after an outage (a young row's short retry delay expires before
+	// an old row's long one). Older claimable rows sort first, so a batch cut
+	// by the limit never skips one.
 	rows, err := tx.QueryContext(ctx, outboxSelect+`
 		WHERE o.status='pending' AND o.next_attempt<=? AND d.enabled=1 AND d.deleted_at IS NULL
-		ORDER BY o.id LIMIT ?`, nowValue, limit)
+		  AND NOT EXISTS (SELECT 1 FROM outbox p
+			WHERE p.destination_id=o.destination_id AND p.id<o.id
+			  AND (p.status='processing' OR (p.status='pending' AND p.next_attempt>?)))
+		ORDER BY o.id LIMIT ?`, nowValue, nowValue, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -130,9 +159,9 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	var item OutboxItem
 	var batchID sql.NullInt64
-	var first, leaseUntil, encrypted, created, updated, deleted, name string
+	var first, leaseUntil, encrypted, created, updated, deleted, name, format string
 	var enabled int
-	if err := scanner.Scan(&item.ID, &batchID, &item.DestinationID, &item.Payload, &item.Attempts, &first, &leaseUntil, &item.LeaseToken, &name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
+	if err := scanner.Scan(&item.ID, &batchID, &item.DestinationID, &item.Payload, &item.PayloadFormat, &item.Attempts, &first, &leaseUntil, &item.LeaseToken, &name, &encrypted, &enabled, &created, &updated, &deleted, &format); err != nil {
 		return OutboxItem{}, err
 	}
 	if batchID.Valid {
@@ -150,10 +179,14 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 		}
 		item.LeaseUntil = &value
 	}
-	item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1}
-	item.Destination.ServiceURL, err = s.box.Decrypt(encrypted)
-	if err != nil {
-		return OutboxItem{}, err
+	item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1, Format: format}
+	// Deleted destinations have their URL scrubbed; claims never select them,
+	// but an empty value must not be treated as a decryption failure.
+	if encrypted != "" {
+		item.Destination.ServiceURL, err = s.box.Open(destinationBinding(item.DestinationID), encrypted)
+		if err != nil {
+			return OutboxItem{}, err
+		}
 	}
 	item.Destination.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 	if err != nil {
@@ -173,7 +206,7 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	return item, nil
 }
 
-func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batchID int64) error {
+func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payloadFormat, payload, now string, batchID int64) error {
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL ORDER BY id")
 	if err != nil {
 		return err
@@ -188,7 +221,7 @@ func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batch
 		if batchID > 0 {
 			batchValue = batchID
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,'pending',?,?,?)", batchValue, destinationID, payload, now, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,payload_format,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,?,'pending',?,?,?)", batchValue, destinationID, payload, payloadFormat, now, now, now); err != nil {
 			rows.Close()
 			return err
 		}
@@ -256,6 +289,26 @@ func (s *Store) RetryClaimedResult(ctx context.Context, item OutboxItem, next ti
 	return changed == 1, nil
 }
 
+// ReleaseClaimed returns a claimed row to pending without counting an
+// attempt. The delivery worker uses it for a destination's younger rows in a
+// batch after an older row for that destination failed: they were never sent,
+// and the failed row's backoff now holds them back so they stay in order.
+// It reports whether the lease token still owned the row.
+func (s *Store) ReleaseClaimed(ctx context.Context, item OutboxItem) (bool, error) {
+	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='pending',attempts=MAX(attempts-1,0),lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", item.ID, item.LeaseToken)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
 // RenewClaimed extends the lease for an in-flight delivery when the caller
 // still owns the lease token. It returns false when another worker has already
 // reclaimed or finalized the row.
@@ -285,4 +338,95 @@ func newOutboxLeaseToken() (string, error) {
 		return "", fmt.Errorf("generate outbox lease token: %w", err)
 	}
 	return hex.EncodeToString(token[:]), nil
+}
+
+// ErrDestinationDisabled is returned when dead letters are retried for a
+// destination that is disabled; re-enable it first so the retry is explicit.
+var ErrDestinationDisabled = errors.New("notification destination is disabled")
+
+// DestinationDelivery summarizes the outbox for one active destination.
+// RetryableDead counts the dead letters RetryDeadOutbox would requeue.
+type DestinationDelivery struct {
+	ID            int64
+	Name          string
+	Enabled       bool
+	Pending       int
+	Processing    int
+	Dead          int
+	RetryableDead int
+}
+
+// retryableDeadOutbox selects dead letters that may be requeued. Rows
+// dead-lettered because the monitoring identity changed, or whose batch
+// belongs to a previous settings generation, describe another tailnet or
+// OAuth identity and stay dead; system notifications (no batch) are eligible.
+// The column prefix lets the same predicate serve a join and an UPDATE.
+func retryableDeadOutbox(prefix string) string {
+	return prefix + `status='dead' AND ` + prefix + `last_error<>'monitoring identity changed' AND (` + prefix + `batch_id IS NULL OR NOT EXISTS (
+		SELECT 1 FROM event_batches eb WHERE eb.id=` + prefix + `batch_id AND eb.generation<>(SELECT generation FROM settings WHERE id=1)))`
+}
+
+// DestinationDeliveries returns per-destination delivery counts for every
+// active destination, including destinations with an empty outbox, through
+// the read-only pool so the status page never waits behind a write.
+func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDelivery, error) {
+	rows, err := s.readDB().QueryContext(ctx, `SELECT d.id,d.name,d.enabled,
+		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
+		COALESCE(SUM(CASE WHEN `+retryableDeadOutbox("o.")+` THEN 1 ELSE 0 END),0)
+		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id
+		WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DestinationDelivery
+	for rows.Next() {
+		var delivery DestinationDelivery
+		var enabled int
+		if err := rows.Scan(&delivery.ID, &delivery.Name, &enabled, &delivery.Pending, &delivery.Processing, &delivery.Dead, &delivery.RetryableDead); err != nil {
+			return nil, err
+		}
+		delivery.Enabled = enabled == 1
+		out = append(out, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, rows.Close()
+}
+
+// RetryDeadOutbox requeues the retryable dead letters of one enabled,
+// active destination with a fresh 24-hour delivery window: attempts restart
+// at zero, the first attempt is now, and the rows are due immediately. It
+// returns the number of requeued rows. Delivery stays at-least-once; a row
+// whose provider accepted the message before it was dead-lettered may be
+// delivered again.
+func (s *Store) RetryDeadOutbox(ctx context.Context, destinationID int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var enabled int
+	if err := tx.QueryRowContext(ctx, "SELECT enabled FROM notification_destinations WHERE id=? AND deleted_at IS NULL", destinationID).Scan(&enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, errors.New("notification destination not found")
+		}
+		return 0, err
+	}
+	if enabled != 1 {
+		return 0, ErrDestinationDisabled
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE outbox
+		SET status='pending',attempts=0,first_attempt=?,next_attempt=?,last_error='',lease_until=NULL,lease_token='',delivered_at=NULL
+		WHERE destination_id=? AND `+retryableDeadOutbox(""), now, now, destinationID)
+	if err != nil {
+		return 0, err
+	}
+	requeued, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return requeued, tx.Commit()
 }

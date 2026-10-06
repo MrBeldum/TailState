@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,12 +11,18 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 type recordedChange struct {
 	Change model.Change
 	Before storedValue
 	After  storedValue
+}
+
+type canonicalResource struct {
+	raw  []byte
+	hash string
 }
 
 type truncationLog struct {
@@ -41,11 +48,33 @@ const (
 	unsupportedConfirmationMessage = "unsupported response pending confirmation"
 	unsupportedRetryInterval       = 5 * time.Minute
 	unsupportedDemotionInterval    = 6 * time.Hour
+	// usersSharedScopeMeta records the generation whose users snapshot was
+	// collected with users?type=all. Older versions requested only members,
+	// so the first type=all poll of an existing users baseline would otherwise
+	// report every pre-existing shared (external) user as newly created.
+	usersSharedScopeMeta = "users_shared_scope_generation"
 )
 
-func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest notify.DigestFunc, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
 	defer func() { err = storageWriteError(err) }()
 	triggerIDs = uniquePositiveIDs(triggerIDs)
+	// Canonicalise every resource before opening the write transaction. The
+	// store uses a single SQLite connection, so CPU-bound normalisation inside
+	// the transaction would delay health checks, metrics, and webhook intake.
+	canonical := make([][]canonicalResource, len(results))
+	for i, result := range results {
+		if result.Error != nil || result.Unsupported {
+			continue
+		}
+		canonical[i] = make([]canonicalResource, len(result.Resources))
+		for j, resource := range result.Resources {
+			raw, hash, canonicalErr := model.CanonicalFor(result.Collector, resource.Data)
+			if canonicalErr != nil {
+				return ChangeBatchResult{}, canonicalErr
+			}
+			canonical[i][j] = canonicalResource{raw: raw, hash: hash}
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ChangeBatchResult{}, err
@@ -83,7 +112,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		}
 		truncations = append(truncations, truncationLog{collector: collector, resource: resource, valueHash: value.hash, observed: value.bytes, limit: limit, reason: value.reason})
 	}
-	for _, result := range results {
+	for resultIndex, result := range results {
 		if result.Error != nil {
 			continue
 		}
@@ -105,7 +134,11 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				continue
 			}
 			next := now.Add(unsupportedDemotionInterval).Format(time.RFC3339Nano)
-			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,'unsupported',?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error='unsupported',next_poll=excluded.next_poll,partial=0`, generation, result.Collector, next)
+			reason := strings.TrimSpace(result.UnsupportedReason)
+			if reason == "" {
+				reason = "unsupported"
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,?,?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error=excluded.last_error,next_poll=excluded.next_poll,partial=0`, generation, result.Collector, reason, next)
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
@@ -116,17 +149,39 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
 			return ChangeBatchResult{}, stateErr
 		}
-		seen := make(map[string]struct{}, len(result.Resources))
-		for _, resource := range result.Resources {
-			seen[resource.ID] = struct{}{}
-			raw, hash, err := model.CanonicalFor(result.Collector, resource.Data)
-			if err != nil {
+		// When an established users baseline predates shared-user collection,
+		// absorb newly visible shared users silently on this one poll as a
+		// baseline extension. Members keep normal created events, and a shared
+		// user that appears on any later poll is reported as created.
+		absorbSharedUsers := false
+		if result.Collector == "users" {
+			var scopeGeneration string
+			scopeErr := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", usersSharedScopeMeta).Scan(&scopeGeneration)
+			if scopeErr != nil && !errors.Is(scopeErr, sql.ErrNoRows) {
+				return ChangeBatchResult{}, scopeErr
+			}
+			absorbSharedUsers = baseline == 1 && scopeGeneration != fmt.Sprint(generation)
+			if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", usersSharedScopeMeta, fmt.Sprint(generation)); err != nil {
 				return ChangeBatchResult{}, err
 			}
+		}
+		// Device details describe a device whose appearance and removal are
+		// already reported by the devices collector. Their snapshots are still
+		// created and deleted (after the same two-poll confirmation), but only
+		// field changes are reported, so one device change is one event.
+		silentLifecycle := result.Collector == "device_details"
+		seen := make(map[string]struct{}, len(result.Resources))
+		for resourceIndex, resource := range result.Resources {
+			seen[resource.ID] = struct{}{}
+			raw, hash := canonical[resultIndex][resourceIndex].raw, canonical[resultIndex][resourceIndex].hash
 			var oldRaw []byte
 			var oldHash, oldType, oldName string
 			var missing, oldBytes, oldTruncated int64
 			err = tx.QueryRowContext(ctx, "SELECT canonical_json,content_hash,resource_type,name,missing_count,content_bytes,content_truncated FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, resource.ID).Scan(&oldRaw, &oldHash, &oldType, &oldName, &missing, &oldBytes, &oldTruncated)
+			// Keep the row exactly as stored: the re-normalisation below
+			// replaces oldRaw/oldHash for diffing, but deciding whether the row
+			// needs a rewrite must compare against what is on disk.
+			storedRaw, storedHash := oldRaw, oldHash
 			oldValue := existingStoredValue(oldRaw, oldHash, oldBytes, oldTruncated == 1)
 			if err == nil && oldHash != hash {
 				var previous any
@@ -144,21 +199,38 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			noteTruncation(result.Collector, resource.ID, storedSnapshot, limits.SnapshotBytes, true)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
-				if baseline == 1 {
+				if baseline == 1 && !silentLifecycle && !(absorbSharedUsers && isSharedUser(resource)) {
 					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
 				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, now.Format(time.RFC3339Nano))
 			case err != nil:
 				return ChangeBatchResult{}, err
 			case oldHash != hash:
-				if baseline == 1 {
+				// A snapshot stored in a different upstream shape (for example
+				// legacy DNS endpoints versus dns/configuration) is compared only
+				// on the fields both shapes express: a shape change alone is
+				// absorbed silently, a real change is still reported.
+				var oldComparable, newComparable []byte
+				transition := false
+				if !oldValue.truncated {
+					oldComparable, newComparable, transition = model.ShapeTransition(result.Collector, oldRaw, raw)
+				}
+				if baseline == 1 && !(transition && bytes.Equal(oldComparable, newComparable)) {
 					diff := model.DiffResult{}
-					if !oldValue.truncated {
+					if transition {
+						diff = model.DiffDetailed(oldComparable, newComparable)
+					} else if !oldValue.truncated {
 						diff = model.DiffDetailed(oldRaw, raw)
 					}
 					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldValue, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
+			case storedHash == hash && oldType == resource.Type && oldName == resource.Name && missing == 0 &&
+				(oldTruncated == 1) == storedSnapshot.truncated && oldBytes == storedSnapshot.bytes && bytes.Equal(storedRaw, storedSnapshot.raw):
+				// Unchanged resource: the stored row is already byte-identical to
+				// what would be written, so skip the UPDATE. Rewriting every
+				// snapshot on every poll produced megabytes of WAL traffic per
+				// poll with no drift.
 			default:
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			}
@@ -260,7 +332,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 			for _, a := range missingRows {
 				if a.missing+1 >= 2 {
-					if baseline == 1 {
+					if baseline == 1 && !silentLifecycle {
 						record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, existingStoredValue(a.raw, a.hash, a.bytes, a.truncated), storedValue{})
 					}
 					_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
@@ -305,6 +377,14 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 		}
 	}
+	// Schema-change detection compares a field transition with the number of
+	// resources each collector returned in this poll.
+	resourceCounts := make(map[string]int, len(results))
+	for _, result := range results {
+		if result.Error == nil && !result.Unsupported {
+			resourceCounts[result.Collector] = len(result.Resources)
+		}
+	}
 	var triggerID int64
 	if len(triggerIDs) > 0 && triggerIDs[0] > 0 {
 		triggerID = triggerIDs[0]
@@ -329,7 +409,26 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			}
 		}
+		muteRules, muteErr := listMuteRules(ctx, tx)
+		if muteErr != nil {
+			return ChangeBatchResult{}, muteErr
+		}
+		mutes := newMuteSet(muteRules)
+		// The digest receives only unmuted changes, with muted fields removed
+		// and severities computed on what is actually shown; History and the
+		// ledger keep every change and field, flagged when muted.
+		notifiable := make([]model.Change, 0, len(recorded))
+		severities := make([]model.Severity, 0, len(recorded))
+		mutedCount := 0
 		for _, entry := range recorded {
+			severity := model.Classify(entry.Change)
+			muted, shown := mutes.evaluate(entry.Change, entry.Before.raw, entry.After.raw)
+			if muted {
+				mutedCount++
+			} else {
+				notifiable = append(notifiable, shown)
+				severities = append(severities, model.Classify(shown))
+			}
 			fields, marshalErr := json.Marshal(persistedFields{Fields: entry.Change.Fields, FieldsTruncated: entry.Change.FieldsTruncated, TotalFields: entry.Change.TotalFields})
 			if marshalErr != nil {
 				return ChangeBatchResult{}, marshalErr
@@ -338,13 +437,13 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			after := boundedValue(entry.After.raw, entry.After.hash, limits.EventValueBytes, limits.RejectBytes)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, limits.EventValueBytes, false)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, limits.EventValueBytes, false)
-			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated))
+			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severity), boolInt(muted))
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
 		}
-		payload := digest(changes)
-		if err = enqueueOutboxTx(ctx, tx, payload, observedAt, batchID); err != nil {
+		input := notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts}
+		if err = enqueueDigestTx(ctx, tx, digest, input, severities, observedAt); err != nil {
 			return ChangeBatchResult{}, err
 		}
 		if err = s.appendEvidenceLedgerTx(ctx, tx, batchID); err != nil {
@@ -382,6 +481,15 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		logStorageTruncation(item.collector, item.resource, item.valueHash, item.observed, item.limit, item.reason)
 	}
 	return result, nil
+}
+
+func isSharedUser(resource model.Resource) bool {
+	data, ok := resource.Data.(map[string]any)
+	if !ok {
+		return false
+	}
+	kind, _ := data["type"].(string)
+	return strings.EqualFold(kind, "shared")
 }
 
 func nullableJSON(raw []byte) any {

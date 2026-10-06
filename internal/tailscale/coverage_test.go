@@ -79,12 +79,11 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 	}))
 	defer primitiveServer.Close()
 	primitive := New(primitiveServer.URL+"/api/v2", primitiveServer.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	// A non-object policy is an invalid upstream response, not a policy whose
+	// every section changed. It must fail so the last snapshot is preserved.
 	resources, err := primitive.Collect(context.Background(), "policy")
-	if err != nil || len(resources) != 1 {
+	if err == nil || len(resources) != 0 || !strings.Contains(err.Error(), "not a JSON object") {
 		t.Fatalf("primitive policy collection=%#v err=%v", resources, err)
-	}
-	if sections, ok := resources[0].Data.(map[string]any); !ok || len(fmt.Sprint(sections["policy"])) != 64 {
-		t.Fatalf("primitive policy was not hashed: %#v", resources[0].Data)
 	}
 }
 
@@ -154,8 +153,8 @@ func TestTailscaleHelpersAndHTTPError(t *testing.T) {
 	if got := tailnetEscaped(New("https://example.invalid/api/v2", "", "", Credentials{Tailnet: "team/foo"})); got != "https://example.invalid/api/v2/tailnet/team%2Ffoo/" {
 		t.Fatalf("escaped tailnet URL=%q", got)
 	}
-	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": "abc"}}); got != "?cursor=abc" {
-		t.Fatalf("next cursor=%q", got)
+	if link, cursor := nextPage(map[string]any{"pagination": map[string]any{"nextCursor": "abc"}}); link != "" || cursor != "abc" {
+		t.Fatalf("next cursor link=%q cursor=%q", link, cursor)
 	}
 	if got := safeBody([]byte(strings.Repeat("x", 201))); len(got) > 200 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("safe body=%q", got)
@@ -182,8 +181,14 @@ func TestLogStreamingAllUnsupportedAndHTTPRetries(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	client := New(unsupported.URL+"/api/v2", unsupported.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
-	if _, err := client.Collect(context.Background(), "log_streaming"); err == nil || !IsUnsupported(err) {
-		t.Fatalf("all-unsupported log streaming error=%v", err)
+	resources, err := client.Collect(context.Background(), "log_streaming")
+	if err != nil || len(resources) != 1 {
+		t.Fatalf("unconfigured log streaming resources=%#v err=%v", resources, err)
+	}
+	for _, kind := range []string{"configuration", "network"} {
+		if state := resources[0].Data.(map[string]any)[kind].(map[string]any); state["configured"] != false {
+			t.Fatalf("404 %s stream should be recorded as not configured, got %#v", kind, state)
+		}
 	}
 	unsupported.Close()
 
@@ -246,7 +251,7 @@ func TestDeviceDetailsPropagatesSecondaryEndpointFailure(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v2/tailnet/-/devices":
 			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
-		case "/api/v2/device/device-1/routes":
+		case "/api/v2/device/device-1/attributes":
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
 			http.NotFound(w, r)

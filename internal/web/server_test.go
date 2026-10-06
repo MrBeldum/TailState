@@ -18,6 +18,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
@@ -148,8 +149,8 @@ func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
 		server.loginAttempts["ip-"+strconv.Itoa(i)] = []time.Time{now}
 	}
 	server.loginAttempts["stale"] = []time.Time{now.Add(-16 * time.Minute)}
-	server.rateLimited("new-ip")
-	server.recordFailure("new-ip")
+	server.throttled(credentialActionLogin, "new-ip")
+	server.recordFailure(credentialActionLogin, "new-ip")
 	if _, ok := server.loginAttempts["stale"]; ok {
 		t.Fatal("stale login attempt state was retained")
 	}
@@ -169,7 +170,7 @@ func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
 	}
 
 	response := coverageCredentialPost(t, server, "/setup/claim", form, nil, "", "198.51.100.25:1234", nil)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Too many setup attempts") {
+	if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "Too many setup attempts") {
 		t.Fatalf("sixth mismatch was not throttled: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -438,7 +439,7 @@ func TestReadyDegradesWhenASecondCollectorStaysUnbaselined(t *testing.T) {
 	if _, _, err := st.RecordCollectorFailure(ctx, generation, "users", "upstream unavailable"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -474,7 +475,7 @@ func TestReadyReportsPostBaselineCollectorDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "provider secret must stay private"); err != nil {
@@ -525,7 +526,7 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 
 	unauthenticated := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/history", nil))
-	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login" {
+	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login?next=%2Fhistory" {
 		t.Fatalf("history was not protected: status=%d location=%q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
 	}
 	unauthenticatedExport := httptest.NewRecorder()
@@ -539,10 +540,10 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 	authenticated := httptest.NewRequest(http.MethodGet, "/history?event_type=changed&resource=device-1", nil)

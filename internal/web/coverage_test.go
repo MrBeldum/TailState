@@ -17,6 +17,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
@@ -213,7 +214,7 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	ready = httptest.NewRecorder()
@@ -237,6 +238,8 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 		"tailstate_storage_wal_bytes",
 		"tailstate_storage_shm_bytes",
 		"tailstate_storage_physical_bytes",
+		"tailstate_storage_enforced_limit_bytes",
+		"tailstate_storage_limit_enforced 1",
 	} {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("notification metric %q missing from metrics body: %s", want, metricsBody)
@@ -365,14 +368,14 @@ func TestLoginLogoutAndResetBranches(t *testing.T) {
 	cookies := correct.Result().Cookies()
 	ip := "192.0.2.1"
 	for i := 0; i < 5; i++ {
-		server.recordFailure(ip)
+		server.recordFailure(credentialActionLogin, server.throttleKey(credentialActionLogin, ip))
 	}
 	rateLimited := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("password=wrong"))
 	rateLimited.RemoteAddr = ip + ":1234"
 	rateLimited.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rateLimitedResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rateLimitedResponse, rateLimited)
-	if rateLimitedResponse.Code != http.StatusOK || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
+	if rateLimitedResponse.Code != http.StatusTooManyRequests || rateLimitedResponse.Header().Get("Retry-After") == "" || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
 		t.Fatalf("rate limited login response %d: %s", rateLimitedResponse.Code, rateLimitedResponse.Body.String())
 	}
 
@@ -483,7 +486,7 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 
 	badIntervals := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "device_interval": {"not-a-number"}, "inventory_interval": {"300"}}
 	badResponse := coveragePost(t, server, "/settings", badIntervals, cookies)
-	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Poll intervals must be whole seconds") {
+	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Device poll interval must be a whole number of seconds") {
 		t.Fatalf("invalid settings response %d: %s", badResponse.Code, badResponse.Body.String())
 	}
 	validSettings := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "webhook_secret": {"webhook-secret"}, "device_interval": {"60"}, "inventory_interval": {"300"}}
@@ -551,14 +554,14 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 	}
 
 	testResponse := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}, "service_url": {"not-a-shoutrrr-url"}}, cookies)
-	if testResponse.Code != http.StatusOK || !strings.Contains(testResponse.Body.String(), "Notification test failed") {
+	if testResponse.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, testResponse), "Notification test failed") {
 		t.Fatalf("invalid destination test response %d: %s", testResponse.Code, testResponse.Body.String())
 	}
 	unknown := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {csrf}, "action": {"unknown"}}, cookies)
 	if unknown.Code != http.StatusBadRequest || !strings.Contains(unknown.Body.String(), "unknown destination action") {
 		t.Fatalf("unknown destination action status=%d body=%s", unknown.Code, unknown.Body.String())
 	}
-	removed := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}}, cookies)
+	removed := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}, "confirm": {"remove"}}, cookies)
 	if removed.Code != http.StatusSeeOther {
 		t.Fatalf("remove destination status=%d body=%s", removed.Code, removed.Body.String())
 	}
@@ -583,7 +586,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/api/v2/tailnet/-/devices" {
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("UPSTREAM-SECRET-RESPONSE"))
 			return
 		}
@@ -605,18 +608,19 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	invalid := coveragePost(t, server, "/settings/destinations", url.Values{
 		"_csrf": {csrf}, "action": {"save"}, "name": {"Invalid"}, "service_url": {"not-a-shoutrrr-url"}, "enabled": {"on"},
 	}, cookies)
-	if invalid.Code != http.StatusOK || !strings.Contains(invalid.Body.String(), "Notification destination was not saved") {
+	if invalid.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, invalid), "Notification destination was not saved") {
 		t.Fatalf("invalid destination save status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 	secretURL := "not-a-shoutrrr-url?token=notification-secret"
 	secretTest := coveragePost(t, server, "/settings/destinations/test", url.Values{
 		"_csrf": {csrf}, "service_url": {secretURL},
 	}, cookies)
-	if secretTest.Code != http.StatusOK || !strings.Contains(secretTest.Body.String(), "Notification test failed") {
+	secretPage := followFlash(t, server, cookies, secretTest)
+	if secretTest.Code != http.StatusSeeOther || !strings.Contains(secretPage, "Notification test failed") {
 		t.Fatalf("secret-bearing notification test status=%d body=%s", secretTest.Code, secretTest.Body.String())
 	}
-	if strings.Contains(secretTest.Body.String(), "notification-secret") {
-		t.Fatalf("destination credential leaked into notification test HTML: %s", secretTest.Body.String())
+	if strings.Contains(secretPage, "notification-secret") {
+		t.Fatalf("destination credential leaked into notification test HTML: %s", secretPage)
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -645,23 +649,24 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	defer failingNotification.Close()
 	failingURL := strings.Replace(failingNotification.URL, "http://", "generic://", 1) + "?disabletls=true"
 	failedTest := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}, "service_url": {failingURL}}, cookies)
-	if failedTest.Code != http.StatusOK || !strings.Contains(failedTest.Body.String(), "Notification test failed") {
+	failedPage := followFlash(t, server, cookies, failedTest)
+	if failedTest.Code != http.StatusSeeOther || !strings.Contains(failedPage, "Notification test failed") {
 		t.Fatalf("failed notification test status=%d body=%s", failedTest.Code, failedTest.Body.String())
 	}
-	if strings.Contains(failedTest.Body.String(), "UPSTREAM-NOTIFICATION-SECRET") {
-		t.Fatalf("provider response leaked into notification test HTML: %s", failedTest.Body.String())
+	if strings.Contains(failedPage, "UPSTREAM-NOTIFICATION-SECRET") {
+		t.Fatalf("provider response leaked into notification test HTML: %s", failedPage)
 	}
 
 	tested := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}}, cookies)
-	if tested.Code != http.StatusOK || !strings.Contains(tested.Body.String(), "Notification test sent") {
+	if tested.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, tested), "Notification test sent") {
 		t.Fatalf("successful destination test status=%d body=%s", tested.Code, tested.Body.String())
 	}
 	unknownToggle := coveragePost(t, server, "/settings/destinations/toggle", url.Values{"_csrf": {csrf}, "id": {"999999"}, "enabled": {"true"}}, cookies)
-	if unknownToggle.Code != http.StatusBadRequest || !strings.Contains(unknownToggle.Body.String(), "Notification destination not found") {
+	if unknownToggle.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, unknownToggle), "Notification destination not found") {
 		t.Fatalf("unknown destination toggle status=%d body=%s", unknownToggle.Code, unknownToggle.Body.String())
 	}
-	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}}, cookies)
-	if unknownDelete.Code != http.StatusBadRequest || !strings.Contains(unknownDelete.Body.String(), "Notification destination not found") {
+	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}, "confirm": {"remove"}}, cookies)
+	if unknownDelete.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, unknownDelete), "Notification destination not found") {
 		t.Fatalf("unknown destination delete status=%d body=%s", unknownDelete.Code, unknownDelete.Body.String())
 	}
 }
@@ -669,7 +674,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 func TestWebAuthenticationAndHelperErrorBranches(t *testing.T) {
 	server, st, _ := testServer(t)
 	unauthorized := coveragePost(t, server, "/logout", nil, nil)
-	if unauthorized.Code != http.StatusUnauthorized {
+	if unauthorized.Code != http.StatusSeeOther || unauthorized.Header().Get("Location") != "/login" {
 		t.Fatalf("unauthenticated logout status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
 	if got := remoteIP(&http.Request{RemoteAddr: "198.51.100.7"}); got != "198.51.100.7" {
@@ -764,7 +769,7 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	webhookBody.Body = webFailingBody{}
 	webhookResponse := httptest.NewRecorder()
 	server.tailscaleWebhook(webhookResponse, webhookBody)
-	if webhookResponse.Code != http.StatusRequestEntityTooLarge {
+	if webhookResponse.Code != http.StatusBadRequest {
 		t.Fatalf("failing webhook body status=%d body=%s", webhookResponse.Code, webhookResponse.Body.String())
 	}
 	if err := st.Close(); err != nil {
@@ -959,24 +964,24 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	server, _, db, cookies := webServerWithDatabase(t)
 	unauthSettings := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthSettings, httptest.NewRequest(http.MethodGet, "/settings", nil))
-	if unauthSettings.Code != http.StatusSeeOther || unauthSettings.Header().Get("Location") != "/login" {
+	if unauthSettings.Code != http.StatusSeeOther || unauthSettings.Header().Get("Location") != "/login?next=%2Fsettings" {
 		t.Fatalf("unauthenticated settings status=%d location=%q", unauthSettings.Code, unauthSettings.Header().Get("Location"))
 	}
 	unauthSettingsPost := coveragePost(t, server, "/settings", url.Values{}, nil)
-	if unauthSettingsPost.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated settings POST status=%d body=%s", unauthSettingsPost.Code, unauthSettingsPost.Body.String())
+	if unauthSettingsPost.Code != http.StatusSeeOther || unauthSettingsPost.Header().Get("Location") != "/login?next=%2Fsettings" {
+		t.Fatalf("unauthenticated settings POST status=%d location=%q", unauthSettingsPost.Code, unauthSettingsPost.Header().Get("Location"))
 	}
 	unauthStatus := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthStatus, httptest.NewRequest(http.MethodGet, "/status", nil))
-	if unauthStatus.Code != http.StatusSeeOther || unauthStatus.Header().Get("Location") != "/login" {
+	if unauthStatus.Code != http.StatusSeeOther || unauthStatus.Header().Get("Location") != "/login?next=%2Fstatus" {
 		t.Fatalf("unauthenticated status status=%d location=%q", unauthStatus.Code, unauthStatus.Header().Get("Location"))
 	}
 	unauthorized := coveragePost(t, server, "/settings/destinations", url.Values{}, nil)
-	if unauthorized.Code != http.StatusUnauthorized {
+	if unauthorized.Code != http.StatusSeeOther || unauthorized.Header().Get("Location") != "/login?next=%2Fsettings" {
 		t.Fatalf("unauthorized destination status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
 	wrongCSRF := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {"wrong"}}, cookies)
-	if wrongCSRF.Code != http.StatusUnauthorized {
+	if wrongCSRF.Code != http.StatusForbidden {
 		t.Fatalf("wrong csrf destination status=%d body=%s", wrongCSRF.Code, wrongCSRF.Body.String())
 	}
 	defaultSave := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {coverageCSRF(t, cookies)}, "name": {"Default action"}, "service_url": {"generic://example.invalid/path"}, "enabled": {"on"}}, cookies)
@@ -999,7 +1004,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 		t.Fatalf("authenticated status did not explain partial collector errors: status=%d body=%s", authStatus.Code, authStatus.Body.String())
 	}
 	server.loginAttempts["stale"] = []time.Time{time.Now().Add(-16 * time.Minute)}
-	if server.rateLimited("stale") {
+	if _, limited := server.throttled(credentialActionLogin, "stale"); limited {
 		t.Fatal("stale login attempts were rate limited")
 	}
 	if _, ok := server.loginAttempts["stale"]; ok {
@@ -1130,7 +1135,7 @@ func TestWebOperationalFailureBranches(t *testing.T) {
 	server, st, _, _ := webServerWithDatabase(t)
 	defer st.Close()
 	server.loginAttempts["recent"] = []time.Time{time.Now()}
-	if server.rateLimited("recent") {
+	if _, limited := server.throttled(credentialActionLogin, "recent"); limited {
 		t.Fatal("a single recent login attempt was rate limited")
 	}
 	if len(server.loginAttempts["recent"]) != 1 {

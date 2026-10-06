@@ -26,6 +26,17 @@ go tool govulncheck ./...
 git diff --check
 ```
 
+When changing workflows, scripts, or the Dockerfile, run the same linters as
+the CI `lint` job (versions are pinned in `.github/workflows/ci.yml`):
+
+```console
+shellcheck -S warning scripts/*.sh
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
+docker run --rm -i hadolint/hadolint:v2.15.1 < Dockerfile
+docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:1.30.1 \
+  --offline --min-severity low --config .github/zizmor.yml .github/workflows
+```
+
 When changing dependency declarations or the Renovate configuration, also
 validate the updater metadata and its local dependency lookup:
 
@@ -45,6 +56,7 @@ docker build --build-arg VERSION=dev -t tailstate:dev .
 bash scripts/container-smoke.sh tailstate:dev
 bash scripts/compose-smoke.sh tailstate:dev
 bash scripts/proxy-smoke.sh tailstate:dev
+bash scripts/remote-compose-check.sh
 bash scripts/container-backup-restore-smoke.sh tailstate:dev
 ```
 
@@ -82,3 +94,12 @@ regression test beside the behavior it protects.
 Describe the user-visible behavior, migration/rollback implications, and the
 validation commands you ran. Keep dependency and GitHub Actions updates
 pin-aware and explain any change to the release or coverage gates.
+
+## Changelog and releases
+
+Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for every
+user-visible change, referencing its issue. When preparing a release, rename
+that section to the version and date and add its `- **Schema:**` and
+`- **Rollback:**` lines; the release workflow refuses a tag whose CHANGELOG
+entry is missing either line. A release that migrates the schema is a minor
+release, and [UPGRADING.md](UPGRADING.md#schema-history) gets a new row.

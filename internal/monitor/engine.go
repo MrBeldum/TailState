@@ -30,6 +30,7 @@ type Engine struct {
 	dueErrors                  atomic.Uint64
 	deliveryStats              deliveryStats
 	cleanupStats               cleanupTelemetry
+	instanceLabel, publicURL   string
 }
 
 const (
@@ -37,7 +38,6 @@ const (
 	deliveryLeaseRenewalFraction    = 3
 	minDeliveryLeaseRenewalInterval = 100 * time.Millisecond
 	deliveryDurationBucketCount     = 9
-	cleanupContinuationInterval     = time.Second
 )
 
 var deliveryDurationBucketBounds = [deliveryDurationBucketCount]float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300}
@@ -136,8 +136,12 @@ var (
 	schedulerWaitInterval      = 5 * time.Second
 	deliveryPollInterval       = 2 * time.Second
 	cleanupPollInterval        = time.Hour
-	collectorPollTimeout       = 2 * time.Minute
-	collectorRetryInterval     = 30 * time.Second
+	// cleanupContinuationInterval is used only when a successful bounded
+	// cleanup pass stopped with work remaining, and as the first retry after
+	// a cleanup error.
+	cleanupContinuationInterval = time.Second
+	collectorPollTimeout        = 2 * time.Minute
+	collectorRetryInterval      = 30 * time.Second
 )
 
 const maxTriggerOverflow = 1024
@@ -149,6 +153,19 @@ func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.S
 	}
 	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: sender, wake: make(chan struct{}, 1), trigger: make(chan ReconcileRequest, 4)}
 }
+
+// ConfigureNotifications sets the instance label and public URL added to
+// every notification. Call it before Run.
+func (e *Engine) ConfigureNotifications(instanceLabel, publicURL string) {
+	e.instanceLabel, e.publicURL = instanceLabel, publicURL
+}
+
+// notificationContext is the identity shown in notifications for one
+// settings generation.
+func (e *Engine) notificationContext(settings store.Settings) notify.Context {
+	return notify.Context{Label: e.instanceLabel, Tailnet: settings.Tailnet, PublicURL: e.publicURL, Version: e.version}
+}
+
 func (e *Engine) Wake() {
 	select {
 	case e.wake <- struct{}{}:
@@ -189,14 +206,18 @@ func (e *Engine) takeTriggerOverflow() []ReconcileRequest {
 	return out
 }
 
-// Run starts the scheduler, delivery worker, and retention worker. Wait must
+// Run starts the scheduler, delivery worker, expiry worker, and retention worker. Wait must
 // be called after the context is cancelled when the owning process is shutting
 // down so the store is not closed while a worker is still writing to it.
 func (e *Engine) Run(ctx context.Context) {
-	e.wg.Add(3)
+	e.wg.Add(4)
 	go func() {
 		defer e.wg.Done()
 		e.scheduler(ctx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.expiryWorker(ctx)
 	}()
 	go func() {
 		defer e.wg.Done()
@@ -330,20 +351,26 @@ func (e *Engine) scheduler(ctx context.Context) {
 			generation = current.Generation
 			settingsRevision = currentRevision
 			settings = current
-			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret})
+			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret, Scopes: settings.OAuthScopes})
 			if identityChanged {
 				initialSuccess := e.poll(ctx, client, settings, allCollectors(), false)
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(nextPollDelay(settings.DeviceInterval, initialSuccess))
-				inventoryTimer = time.NewTimer(nextPollDelay(settings.InventoryInterval, initialSuccess))
+				// The initial poll only covers collectors that are already due.
+				// Persisted per-collector deadlines (failure retries, unsupported
+				// confirmation) must survive a restart instead of being replaced by
+				// the full configured interval.
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, initialSuccess))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, initialSuccess))
 			} else {
 				// Refreshing a credential or interval must not reset the baseline,
 				// but the old timers must not keep using the previous interval.
+				// Short persisted retry deadlines still apply, so an operator who
+				// fixes a broken secret gets the pending retry promptly.
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(jitter(settings.DeviceInterval))
-				inventoryTimer = time.NewTimer(jitter(settings.InventoryInterval))
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, true))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, true))
 			}
 		}
 		if overflow := e.takeTriggerOverflow(); len(overflow) > 0 {
@@ -489,6 +516,8 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		partial   bool
 	}
 	measurements := make([]measurement, 0, len(collectors))
+	var unhealthy []notify.CollectorHealth
+	var recovered []string
 	for _, collector := range collectors {
 		if !force {
 			due, dueErr := e.store.CollectorDueWithError(ctx, settings.Generation, collector)
@@ -537,7 +566,8 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		if err != nil && tailscale.IsUnsupportedCollector(collector, err) {
 			result.Error = nil
 			result.Unsupported = true
-			slog.Info("collector unsupported", "collector", collector)
+			result.UnsupportedReason = tailscale.UnsupportedReason(err)
+			slog.Info("collector unsupported", "collector", collector, "reason", result.UnsupportedReason)
 		} else if err != nil {
 			success = false
 			collectorSuccess = false
@@ -547,25 +577,35 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 				slog.Error("record collector failure", "collector", collector, "error", storeErr)
 			}
 			if shouldNotify {
-				if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, false)); enqueueErr != nil {
-					slog.Error("enqueue collector health notification", "collector", collector, "error", enqueueErr)
-				}
+				unhealthy = append(unhealthy, notify.CollectorHealth{Collector: collector, Reason: tailscale.FailureCategory(err)})
 			}
 			slog.Warn("collector failed", "collector", collector, "error", safeError)
 		} else if wasUnhealthy {
-			if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, true)); enqueueErr != nil {
-				slog.Error("enqueue collector recovery notification", "collector", collector, "error", enqueueErr)
-			}
+			recovered = append(recovered, collector)
 		}
 		outcome.collectors[collector] = collectorSuccess
 		results = append(results, result)
 		measurements = append(measurements, measurement{collector: collector, duration: duration, partial: result.Partial})
 	}
+	// Health transitions from one poll are grouped into one message per
+	// direction, so a revoked credential produces one alert instead of one per
+	// collector.
+	messages := e.notificationContext(settings)
+	if len(unhealthy) > 0 {
+		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsUnhealthy(unhealthy, time.Now())); enqueueErr != nil {
+			slog.Error("enqueue collector health notification", "collectors", len(unhealthy), "error", enqueueErr)
+		}
+	}
+	if len(recovered) > 0 {
+		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsRecovered(recovered, time.Now())); enqueueErr != nil {
+			slog.Error("enqueue collector recovery notification", "collectors", len(recovered), "error", enqueueErr)
+		}
+	}
 	if len(polled) == 0 {
 		outcome.success = success
 		return outcome
 	}
-	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerIDs...)
+	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, messages.Digest, triggerIDs...)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {
@@ -619,11 +659,48 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 	if err := e.store.SetNextPollErr(ctx, settings.Generation, inventoryCollectors, time.Now().Add(settings.InventoryInterval)); err != nil {
 		slog.Error("schedule inventory collectors", "error", err)
 	}
-	if err := e.store.SetNextPollErr(ctx, settings.Generation, retryCollectors, time.Now().Add(collectorRetryInterval)); err != nil {
-		slog.Error("schedule collector retry", "error", err)
-	}
+	e.scheduleCollectorRetries(ctx, settings, retryCollectors)
 	outcome.success = success
 	return outcome
+}
+
+// scheduleCollectorRetries reschedules failed or partial collectors with an
+// exponential backoff based on their persisted consecutive failure count. The
+// delay starts at collectorRetryInterval and is capped at the collector's
+// configured interval, so a permanently broken endpoint (or one device whose
+// detail request keeps failing) settles back to the normal cadence instead of
+// repeating a full fan-out every 30 seconds.
+func (e *Engine) scheduleCollectorRetries(ctx context.Context, settings store.Settings, collectors []string) {
+	if len(collectors) == 0 {
+		return
+	}
+	failures, err := e.store.CollectorFailureCounts(ctx, settings.Generation, collectors)
+	if err != nil {
+		slog.Error("read collector failure counts", "error", err)
+	}
+	now := time.Now()
+	for _, collector := range collectors {
+		interval := settings.InventoryInterval
+		if collector == "devices" {
+			interval = settings.DeviceInterval
+		}
+		next := now.Add(collectorRetryDelay(failures[collector], interval))
+		if err := e.store.SetNextPollErr(ctx, settings.Generation, []string{collector}, next); err != nil {
+			slog.Error("schedule collector retry", "collector", collector, "error", err)
+		}
+	}
+}
+
+// collectorRetryDelay doubles collectorRetryInterval for each consecutive
+// failure after the first and caps the result at the configured interval. An
+// interval shorter than the base retry keeps the base retry.
+func collectorRetryDelay(failures int, interval time.Duration) time.Duration {
+	limit := max(interval, collectorRetryInterval)
+	delay := collectorRetryInterval
+	for attempt := 1; attempt < failures && delay < limit; attempt++ {
+		delay *= 2
+	}
+	return min(delay, limit)
 }
 
 func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings) bool {
@@ -643,39 +720,22 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	if len(triggers) == 0 {
 		return false
 	}
-	type triggerGroup struct {
-		claims     []store.WebhookTrigger
-		collectors []string
-	}
-	groups := make(map[string]*triggerGroup, len(triggers))
+	// Coalesce every trigger claimed in this pass into one poll of the union
+	// of their collectors, so overlapping webhook scopes poll each collector at
+	// most once. Outcomes stay per collector: each claim is completed or
+	// retried only on the collectors it requested.
+	var collectors []string
 	for _, trigger := range triggers {
-		collectors := normalizeCollectors(trigger.Collectors)
-		key := strings.Join(collectors, "\x00")
-		if len(collectors) == 0 {
-			key = "*"
+		scope := normalizeCollectors(trigger.Collectors)
+		if len(scope) == 0 {
+			collectors = allCollectors()
+			break
 		}
-		group := groups[key]
-		if group == nil {
-			group = &triggerGroup{collectors: collectors}
-			if key == "*" {
-				group.collectors = allCollectors()
-			}
-			groups[key] = group
-		}
-		group.claims = append(group.claims, trigger)
+		collectors = append(collectors, scope...)
 	}
-	keys := make([]string, 0, len(groups))
-	for key := range groups {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		group := groups[key]
-		triggerIDs := webhookTriggerIDs(group.claims)
-		outcome := e.pollWithOutcomes(ctx, client, settings, group.collectors, true, triggerIDs...)
-		for _, claim := range group.claims {
-			e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
-		}
+	outcome := e.pollWithOutcomes(ctx, client, settings, normalizeCollectors(collectors), true, webhookTriggerIDs(triggers)...)
+	for _, claim := range triggers {
+		e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
 	}
 	return true
 }
@@ -835,8 +895,19 @@ func (e *Engine) delivery(ctx context.Context) {
 			for _, item := range items {
 				leases[item.ID] = e.startOutboxLease(ctx, item)
 			}
+			// After a destination's first failed send in this batch, its
+			// younger items are returned unsent: the failed item's backoff
+			// keeps them in order, and a hanging destination costs the
+			// others at most one send timeout per tick.
+			failed := make(map[int64]bool)
 			for _, item := range items {
-				e.deliverItemWithLease(ctx, item, leases[item.ID])
+				if failed[item.DestinationID] {
+					e.releaseItem(ctx, item, leases[item.ID])
+					continue
+				}
+				if e.deliverItemWithLease(ctx, item, leases[item.ID]) {
+					failed[item.DestinationID] = true
+				}
 			}
 			for _, lease := range leases {
 				lease.stop()
@@ -852,13 +923,48 @@ func (e *Engine) startOutboxLease(ctx context.Context, item store.OutboxItem) *d
 	return lease
 }
 
-func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem, lease *deliveryLease) {
+// releaseItem returns a claimed item that was not sent to pending without
+// counting an attempt.
+func (e *Engine) releaseItem(ctx context.Context, item store.OutboxItem, lease *deliveryLease) {
+	lease.stop()
+	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	released, err := e.store.ReleaseClaimed(bookkeepingCtx, item)
+	if err != nil {
+		// The lease expires and the row returns to pending on a later claim.
+		slog.Error("release unsent notification", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
+		return
+	}
+	if !released {
+		if lease != nil {
+			e.noteDeliveryLeaseLost(lease.state)
+		}
+		slog.Warn("notification release fenced", "outbox_id", item.ID, "destination_id", item.DestinationID)
+		return
+	}
+	slog.Debug("notification held behind a failed delivery", "outbox_id", item.ID, "destination_id", item.DestinationID)
+}
+
+// deliverItemWithLease sends one claimed item and records the outcome. It
+// reports whether the destination was contacted and the send failed, which
+// holds back the destination's younger items in the same batch.
+func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem, lease *deliveryLease) (sendFailed bool) {
 	e.deliveryStats.attempts.Add(1)
 	started := time.Now()
 	if lease == nil {
 		lease = e.startOutboxLease(ctx, item)
 	}
-	sendErr := e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
+	// Render the stored payload for this destination's service (or its
+	// override) and fit it to the service budget. Legacy Markdown rows are
+	// sent unchanged. A payload that cannot be decoded can never succeed and
+	// is dead-lettered without contacting the provider.
+	message, prepareErr := notify.Prepare(item.PayloadFormat, item.Payload, item.Destination.ServiceURL, item.Destination.Format)
+	var sendErr error
+	if prepareErr != nil {
+		sendErr = &notify.DeliveryError{Message: prepareErr.Error(), Permanent: true}
+	} else {
+		sendErr = e.sender.Send(ctx, item.Destination.ServiceURL, message)
+	}
 	lease.stop()
 	elapsed := time.Since(started)
 	e.recordDeliveryDuration(elapsed)
@@ -877,15 +983,18 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 			slog.Warn("notification delivery completion fenced", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds())
 		}
 		slog.Debug("notification delivery completed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost)
-		return
+		return false
 	}
+	// A payload that could not be prepared never reached the provider and
+	// says nothing about the destination's health.
+	sendFailed = prepareErr == nil
 	e.deliveryStats.failures.Add(1)
 	// Senders are injectable for tests and future transports. Apply the same
 	// destination-aware redaction at this boundary so an upstream provider
 	// error cannot reach logs or durable outbox history even if the sender did
 	// not sanitize it itself.
 	safeMessage := notify.SafeDeliveryError(sendErr)
-	dead := time.Since(item.FirstAttempt) >= 24*time.Hour
+	dead := time.Since(item.FirstAttempt) >= 24*time.Hour || notify.IsPermanent(sendErr)
 	var delivery *notify.DeliveryError
 	delay := retryDelay(item.Attempts)
 	if errors.As(sendErr, &delivery) && delivery.RetryAfter > 0 {
@@ -904,6 +1013,7 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 	} else {
 		slog.Warn("notification delivery failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost, "error", safeMessage)
 	}
+	return sendFailed
 }
 
 func (e *Engine) renewOutboxLease(ctx context.Context, item store.OutboxItem, state *deliveryLeaseState, done chan<- struct{}) {
@@ -991,8 +1101,34 @@ func (e *Engine) recordCleanup(stats store.CleanupStats, err error) {
 	e.cleanupStats.deadOutboxDeleted.Add(uint64(max(stats.DeadOutboxDeleted, 0)))
 }
 
+// cleanupBackoff schedules retention passes. Genuine leftover work continues
+// after cleanupContinuationInterval; consecutive errors back off
+// exponentially from that interval up to cleanupPollInterval so a persistent
+// failure (corruption, a full disk, a storage limit) does not open a write
+// transaction and log an error every second forever. A successful pass
+// resets the backoff.
+type cleanupBackoff struct {
+	failures int
+}
+
+func (b *cleanupBackoff) next(remaining bool, err error) time.Duration {
+	if err != nil {
+		b.failures++
+		delay := cleanupContinuationInterval
+		for attempt := 1; attempt < b.failures && delay < cleanupPollInterval; attempt++ {
+			delay *= 2
+		}
+		return min(delay, cleanupPollInterval)
+	}
+	b.failures = 0
+	if remaining && cleanupPollInterval > cleanupContinuationInterval {
+		return cleanupContinuationInterval
+	}
+	return cleanupPollInterval
+}
+
 func (e *Engine) cleanup(ctx context.Context) {
-	run := func(initial bool) bool {
+	run := func(initial bool) (bool, error) {
 		stats, err := e.store.CleanupWithOptions(ctx, store.CleanupOptions{Retention: 30 * 24 * time.Hour})
 		e.recordCleanup(stats, err)
 		if err != nil {
@@ -1003,32 +1139,23 @@ func (e *Engine) cleanup(ctx context.Context) {
 					slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
 				}
 			}
-			// A transient lock or I/O error should be retried on the early
-			// continuation schedule instead of waiting a full hour.
-			return true
+			// A transient lock or I/O error is retried soon, with backoff for
+			// consecutive failures (see cleanupBackoff).
+			return stats.Remaining, err
 		}
-		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining)
-		return stats.Remaining
+		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining, "pages_released", stats.PagesReleased, "wal_checkpointed", stats.WALCheckpointed)
+		return stats.Remaining, nil
 	}
 
-	remaining := run(true)
-	wait := cleanupPollInterval
-	if remaining && wait > cleanupContinuationInterval {
-		wait = cleanupContinuationInterval
-	}
-	timer := time.NewTimer(wait)
+	var backoff cleanupBackoff
+	timer := time.NewTimer(backoff.next(run(true)))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			remaining = run(false)
-			wait := cleanupPollInterval
-			if remaining && wait > cleanupContinuationInterval {
-				wait = cleanupContinuationInterval
-			}
-			timer.Reset(wait)
+			timer.Reset(backoff.next(run(false)))
 		}
 	}
 }

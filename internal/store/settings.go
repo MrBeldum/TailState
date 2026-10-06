@@ -9,21 +9,48 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/notify"
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
+
+// Local settings bounds. They are exported so the settings form can reject
+// out-of-range input before any outbound Tailscale request.
+const (
+	MinDevicePollInterval    = 15 * time.Second
+	MinInventoryPollInterval = 30 * time.Second
+	MaxPollInterval          = 24 * time.Hour
+	MaxWebhookSecretBytes    = 1024
+	MaxTailnetBytes          = 255
+)
+
+// ValidateSettings checks the settings constraints that need no I/O. It is
+// applied by SaveSettings, so out-of-range values can never be persisted.
+func ValidateSettings(in Settings) error {
+	tailnet := strings.TrimSpace(in.Tailnet)
+	if len(tailnet) > MaxTailnetBytes || strings.ContainsAny(tailnet, "/?#%\\ \t\r\n") {
+		return errors.New("tailnet name is too long or contains invalid characters")
+	}
+	if len(strings.TrimSpace(in.WebhookSecret)) > MaxWebhookSecretBytes {
+		return fmt.Errorf("webhook secret exceeds %d bytes", MaxWebhookSecretBytes)
+	}
+	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
+		return errors.New("OAuth credentials are required")
+	}
+	if in.DeviceInterval < MinDevicePollInterval || in.DeviceInterval > MaxPollInterval {
+		return fmt.Errorf("device poll interval must be between %s and %s", MinDevicePollInterval, MaxPollInterval)
+	}
+	if in.InventoryInterval < MinInventoryPollInterval || in.InventoryInterval > MaxPollInterval {
+		return fmt.Errorf("inventory poll interval must be between %s and %s", MinInventoryPollInterval, MaxPollInterval)
+	}
+	return validateMonitoringOptions(in)
+}
 
 func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	if strings.TrimSpace(in.Tailnet) == "" {
 		in.Tailnet = "-"
 	}
 	in.WebhookSecret = strings.TrimSpace(in.WebhookSecret)
-	if len(in.WebhookSecret) > 1024 {
-		return 0, errors.New("webhook secret is too long")
-	}
-	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
-		return 0, errors.New("OAuth credentials are required")
-	}
-	if in.DeviceInterval < 15*time.Second || in.InventoryInterval < 30*time.Second {
-		return 0, errors.New("poll intervals are too short")
+	if err := ValidateSettings(in); err != nil {
+		return 0, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -41,11 +68,11 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if err != nil {
 		return 0, err
 	} else {
-		oldSecret, decryptErr := s.box.Decrypt(oldSecretEnc)
+		oldSecret, decryptErr := s.box.Open(settingsBinding("oauth_secret_enc"), oldSecretEnc)
 		if decryptErr != nil {
 			return 0, decryptErr
 		}
-		if oldSecret == in.OAuthClientSecret {
+		if oldSecret == in.OAuthClientSecret && secret.IsCurrentEnvelope(oldSecretEnc) {
 			secretEnc = oldSecretEnc
 		}
 		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID {
@@ -54,7 +81,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		}
 	}
 	if secretEnc == "" {
-		secretEnc, err = s.box.Encrypt(in.OAuthClientSecret)
+		secretEnc, err = s.box.Seal(settingsBinding("oauth_secret_enc"), in.OAuthClientSecret)
 		if err != nil {
 			return 0, err
 		}
@@ -65,12 +92,12 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if in.WebhookSecret != "" {
 		reuse := false
 		if oldWebhookSecretEnc != "" {
-			if oldWebhookSecret, decryptErr := s.box.Decrypt(oldWebhookSecretEnc); decryptErr == nil && oldWebhookSecret == in.WebhookSecret {
+			if oldWebhookSecret, decryptErr := s.box.Open(settingsBinding("webhook_secret_enc"), oldWebhookSecretEnc); decryptErr == nil && oldWebhookSecret == in.WebhookSecret && secret.IsCurrentEnvelope(oldWebhookSecretEnc) {
 				reuse = true
 			}
 		}
 		if !reuse {
-			webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
+			webhookSecretEnc, err = s.box.Seal(settingsBinding("webhook_secret_enc"), in.WebhookSecret)
 			if err != nil {
 				return 0, err
 			}
@@ -85,8 +112,8 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		if convertErr != nil {
 			return 0, convertErr
 		}
-		if oldLegacyURL, decryptErr := s.box.Decrypt(legacyURLEnc); decryptErr != nil || oldLegacyURL != in.MattermostURL {
-			legacyURLEnc, err = s.box.Encrypt(in.MattermostURL)
+		if oldLegacyURL, decryptErr := s.box.Open(settingsBinding("mattermost_url_enc"), legacyURLEnc); decryptErr != nil || oldLegacyURL != in.MattermostURL || !secret.IsCurrentEnvelope(legacyURLEnc) {
+			legacyURLEnc, err = s.box.Seal(settingsBinding("mattermost_url_enc"), in.MattermostURL)
 			if err != nil {
 				return 0, err
 			}
@@ -120,6 +147,9 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			return 0, err
 		}
 	}
+	if err := saveMonitoringOptionsTx(ctx, tx, in, generation); err != nil {
+		return 0, err
+	}
 	if generationChanged {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation<>?", generation); err != nil {
 			return 0, err
@@ -130,10 +160,13 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		// Event-linked notifications describe the previous Tailnet/OAuth
 		// identity. Keep their history for audit, but do not deliver them after
 		// the monitor has switched identities. System/version notifications use a
-		// NULL batch_id and intentionally remain eligible for delivery.
+		// NULL batch_id and intentionally remain eligible for delivery. Rows that
+		// are in flight (or were left 'processing' by a crash) are included and
+		// lose their lease so a stale worker's completion or retry is fenced off
+		// instead of re-queuing the old-identity payload.
 		if _, err := tx.ExecContext(ctx, `UPDATE outbox
-			SET status='dead',next_attempt=?,last_error='monitoring identity changed'
-			WHERE status='pending' AND batch_id IS NOT NULL AND batch_id IN (
+			SET status='dead',next_attempt=?,last_error='monitoring identity changed',lease_until=NULL,lease_token=''
+			WHERE status IN ('pending','processing') AND batch_id IS NOT NULL AND batch_id IN (
 				SELECT id FROM event_batches WHERE generation<>?
 			)`, now, generation); err != nil {
 			return 0, err
@@ -153,18 +186,18 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	out.OAuthClientSecret, err = s.box.Decrypt(secretEnc)
+	out.OAuthClientSecret, err = s.box.Open(settingsBinding("oauth_secret_enc"), secretEnc)
 	if err != nil {
 		return Settings{}, err
 	}
 	if urlEnc != "" {
-		out.MattermostURL, err = s.box.Decrypt(urlEnc)
+		out.MattermostURL, err = s.box.Open(settingsBinding("mattermost_url_enc"), urlEnc)
 		if err != nil {
 			return Settings{}, err
 		}
 	}
 	if webhookSecretEnc != "" {
-		out.WebhookSecret, err = s.box.Decrypt(webhookSecretEnc)
+		out.WebhookSecret, err = s.box.Open(settingsBinding("webhook_secret_enc"), webhookSecretEnc)
 		if err != nil {
 			return Settings{}, err
 		}
@@ -183,10 +216,13 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 		}
 		out.BaselineAt = &t
 	}
+	if err := s.loadMonitoringOptions(ctx, &out); err != nil {
+		return Settings{}, err
+	}
 	return out, nil
 }
 
-func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) string) (bool, error) {
+func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) notify.Message) (bool, error) {
 	current = strings.TrimSpace(current)
 	if current == "" || current == "dev" {
 		return false, nil
@@ -224,8 +260,11 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	notified := configured > 0 && enabledDestinations > 0
 	if notified {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		payload := notification(previous, current)
-		if err = enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
+		payloadFormat, payload, encodeErr := notify.EncodePayload(notification(previous, current))
+		if encodeErr != nil {
+			return false, encodeErr
+		}
+		if err = enqueueOutboxTx(ctx, tx, payloadFormat, payload, now, 0); err != nil {
 			return false, err
 		}
 	}

@@ -20,9 +20,12 @@ type Resource struct {
 }
 
 type Collected struct {
-	Collector         string
-	Resources         []Resource
-	Unsupported       bool
+	Collector   string
+	Resources   []Resource
+	Unsupported bool
+	// UnsupportedReason is a bounded label (never provider text) recorded as
+	// the collector's status when Unsupported is set.
+	UnsupportedReason string
 	Partial           bool
 	PartialError      string
 	PartialErrorCount int
@@ -67,6 +70,11 @@ var redactedFields = map[string]struct{}{
 	"tokenvalue":    {},
 	"password":      {},
 	"webhooksecret": {},
+	// Log-streaming destination credentials. The API documents
+	// s3SecretAccessKey as write-only but does not mark gcsCredentials that
+	// way; neither may ever be stored or diffed in clear text.
+	"gcscredentials":    {},
+	"s3secretaccesskey": {},
 }
 
 var collectorFields = map[string]map[string]struct{}{
@@ -79,9 +87,18 @@ var collectorFields = map[string]map[string]struct{}{
 	"users": fieldSet(
 		"id", "displayname", "loginname", "profilepicurl", "tailnetid", "created", "type", "role", "status",
 	),
-	"device_details": fieldSet("routes", "postureattributes", "deviceinvites"),
+	// Routes are reported by the devices collector (fields=all). Dropping the
+	// legacy "routes" key here also re-normalizes snapshots stored by older
+	// releases, so upgrading does not report the removal as drift.
+	"device_details": fieldSet("postureattributes", "deviceinvites"),
 	"posture":        fieldSet("provider", "cloudid", "clientid", "tenantid", "id", "configupdated", "status"),
 	"log_streaming":  fieldSet("configuration", "network"),
+	// Tailscale Services (VIPServiceInfo). Addresses, ports, and tags are the
+	// exposure surface; the display name and comment identify the service.
+	"services": fieldSet("name", "displayname", "addrs", "comment", "ports", "tags"),
+	// OAuth apps. clientSecret is only returned at creation and is excluded
+	// along with the volatile created/updated timestamps.
+	"oauth_apps": fieldSet("id", "name", "description", "redirecturis", "scopes", "allowednodeattributes"),
 }
 
 func fieldSet(fields ...string) map[string]struct{} {
@@ -111,6 +128,22 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 				continue
 			}
 			if collector == "device_details" && compact == "detail" {
+				continue
+			}
+			if collector == "device_details" && devicePostureDuplicate(path, compact) {
+				continue
+			}
+			if collector == "device_details" && postureExpiries(path, compact) {
+				// The attributes endpoint returns per-attribute expiry
+				// timestamps next to the values. Integrations refresh them
+				// on every sync, so they would report drift on each poll.
+				continue
+			}
+			if collector == "log_streaming" && root && legacyUnsupportedLogStream(child) {
+				// Releases before v0.11.16 stored a 404 ("not configured")
+				// as {"unsupported": true}; read it as the current
+				// explicit state so upgrading does not report drift.
+				out[key] = map[string]any{"configured": false}
 				continue
 			}
 			if !tenantKeys {
@@ -163,6 +196,29 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 	default:
 		return value
 	}
+}
+
+// devicePostureDuplicates are built-in posture attributes that repeat the
+// devices collector's clientVersion and os fields. Reporting them again under
+// device_details would turn one client upgrade into two notifications.
+var devicePostureDuplicates = map[string]struct{}{
+	"node:tsversion": {},
+	"node:os":        {},
+	"node:osversion": {},
+}
+
+func devicePostureDuplicate(path, key string) bool {
+	if _, duplicate := devicePostureDuplicates[key]; !duplicate {
+		return false
+	}
+	section, _, _ := strings.Cut(path, ".")
+	return strings.EqualFold(section, "postureAttributes")
+}
+
+// postureExpiries reports the expiries map of a device's posture attributes
+// response, which holds {"attributes": ..., "expiries": ...}.
+func postureExpiries(path, key string) bool {
+	return key == "expiries" && strings.EqualFold(path, "postureAttributes")
 }
 
 func tenantKeySection(collector, key string) bool {
@@ -244,10 +300,27 @@ func normalizeUserStatus(value any) any {
 	return value
 }
 
+func legacyUnsupportedLogStream(value any) bool {
+	stream, ok := value.(map[string]any)
+	if !ok || len(stream) != 1 {
+		return false
+	}
+	unsupported, ok := stream["unsupported"].(bool)
+	return ok && unsupported
+}
+
+// HealthStatusUnavailable records that a collector could read a resource's
+// configuration but not its health status (for example a log stream whose
+// logging backend is unreachable).
+const HealthStatusUnavailable = "unavailable"
+
 func normalizeHealthStatus(value any) any {
 	status, ok := value.(map[string]any)
 	if !ok {
 		return value
+	}
+	if state, ok := status["state"].(string); ok && state == HealthStatusUnavailable && len(status) == 1 {
+		return map[string]any{"state": HealthStatusUnavailable}
 	}
 	errorMessage, _ := status["error"].(string)
 	if errorMessage == "" {

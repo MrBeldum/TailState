@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 type Config struct {
@@ -25,6 +27,15 @@ type Config struct {
 	OAuthTokenURL  string
 	Version        string
 	StorageLimits  StorageLimits
+	// Container is set by the official image (TAILSTATE_CONTAINER=1). Its
+	// wildcard listener is then bounded by Docker/Compose port publishing.
+	Container bool
+	// PublicURL is the optional external https base URL used to link
+	// notifications to History and Status. It never has a trailing slash.
+	PublicURL string
+	// InstanceLabel optionally names this TailState instance in every
+	// notification title.
+	InstanceLabel string
 }
 
 // StorageLimits contains operator-selected byte ceilings. A zero field keeps
@@ -63,6 +74,11 @@ func Load(version string) (Config, error) {
 		return Config{}, fmt.Errorf("TAILSTATE_COOKIE_SECURE: %w", err)
 	}
 	c.CookieSecure = secure
+	container, err := strconv.ParseBool(env("TAILSTATE_CONTAINER", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_CONTAINER: %w", err)
+	}
+	c.Container = container
 	trustedProxies, err := parseTrustedProxies(env("TAILSTATE_TRUSTED_PROXIES", ""))
 	if err != nil {
 		return Config{}, err
@@ -82,6 +98,12 @@ func Load(version string) (Config, error) {
 	}
 	if _, _, err := net.SplitHostPort(c.ListenAddr); err != nil {
 		return Config{}, fmt.Errorf("TAILSTATE_LISTEN_ADDR must be host:port: %w", err)
+	}
+	if c.PublicURL, err = notify.ValidatePublicURL(env("TAILSTATE_PUBLIC_URL", "")); err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_PUBLIC_URL: %w", err)
+	}
+	if c.InstanceLabel, err = notify.ValidateInstanceLabel(env("TAILSTATE_INSTANCE_LABEL", "")); err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_INSTANCE_LABEL: %w", err)
 	}
 	if err := validateEndpoint("TAILSTATE_TS_API_URL", c.TailscaleBase); err != nil {
 		return Config{}, err
@@ -163,6 +185,27 @@ func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "tailsta
 // not a hard rejection: a container or a local development proxy may own the
 // network boundary, but operators should get an explicit diagnostic when they
 // choose that deployment shape.
+// ContainerWildcardListener reports whether the plaintext listener is the
+// container image's all-interfaces default. Inside a container that address
+// is only the container's own network namespace; exposure is decided by the
+// published host port (loopback in the default Compose file), so this shape
+// is informational rather than a warning.
+func (c Config) ContainerWildcardListener() bool {
+	if !c.Container || !c.InsecureHTTPListener() {
+		return false
+	}
+	host, _, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.IsUnspecified()
+}
+
 func (c Config) InsecureHTTPListener() bool {
 	if c.CookieSecure {
 		return false

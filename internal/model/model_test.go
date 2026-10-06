@@ -481,9 +481,12 @@ func TestOperationalStatusUsesStableHealthState(t *testing.T) {
 
 func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 	value := map[string]any{
-		"detail":  map[string]any{"hostname": "server", "addresses": []any{"100.64.0.1"}},
-		"routes":  map[string]any{"enabledRoutes": []any{"10.0.0.0/24"}},
-		"invites": []any{},
+		"detail": map[string]any{"hostname": "server", "addresses": []any{"100.64.0.1"}},
+		"routes": map[string]any{"enabledRoutes": []any{"10.0.0.0/24"}},
+		"postureAttributes": map[string]any{"attributes": map[string]any{
+			"node:os": "linux", "node:osVersion": "6.1", "node:tsVersion": "1.80.0", "custom:tier": "prod",
+		}},
+		"deviceInvites": []any{},
 	}
 	raw, _, err := CanonicalFor("device_details", value)
 	if err != nil {
@@ -492,7 +495,86 @@ func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 	if strings.Contains(string(raw), "detail") || strings.Contains(string(raw), "hostname") {
 		t.Fatalf("duplicated core device retained: %s", raw)
 	}
-	if !strings.Contains(string(raw), "enabledRoutes") {
+	if strings.Contains(string(raw), "enabledRoutes") || strings.Contains(string(raw), "node:") {
+		t.Fatalf("routes or OS/version posture attributes duplicated from devices were retained: %s", raw)
+	}
+	if !strings.Contains(string(raw), "custom:tier") || !strings.Contains(string(raw), "deviceInvites") {
 		t.Fatalf("secondary device details were removed: %s", raw)
+	}
+}
+
+// TestPostureAttributeExpiriesAreIgnored keeps refreshed posture expiry
+// timestamps from reporting drift while the attribute values stay monitored.
+func TestPostureAttributeExpiriesAreIgnored(t *testing.T) {
+	snapshot := func(expiry, tier string) []byte {
+		raw, _, err := CanonicalFor("device_details", map[string]any{"postureAttributes": map[string]any{
+			"attributes": map[string]any{"custom:tier": tier},
+			"expiries":   map[string]any{"custom:tier": expiry},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	first, refreshed := snapshot("2026-10-05T12:00:00Z", "prod"), snapshot("2026-10-06T12:00:00Z", "prod")
+	if string(first) != string(refreshed) || strings.Contains(string(first), "expiries") {
+		t.Fatalf("posture expiries changed the snapshot: %s vs %s", first, refreshed)
+	}
+	if diff := Diff(first, snapshot("2026-10-06T12:00:00Z", "dev")); len(diff) != 1 || diff[0].Field != "postureAttributes.attributes.custom:tier" {
+		t.Fatalf("attribute value change was not reported: %+v", diff)
+	}
+	// An "expiries" key elsewhere is ordinary data.
+	raw, _, err := CanonicalFor("device_details", map[string]any{"deviceInvites": []any{map[string]any{"expiries": "x"}}})
+	if err != nil || !strings.Contains(string(raw), "expiries") {
+		t.Fatalf("unrelated expiries key was dropped: %s err=%v", raw, err)
+	}
+}
+
+func TestLegacyUnsupportedLogStreamNormalizesToNotConfigured(t *testing.T) {
+	legacy := map[string]any{
+		"configuration": map[string]any{"unsupported": true},
+		"network":       map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{}},
+	}
+	current := map[string]any{
+		"configuration": map[string]any{"configured": false},
+		"network":       map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{}},
+	}
+	_, legacyHash, err := CanonicalFor("log_streaming", legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, currentHash, err := CanonicalFor("log_streaming", current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash != currentHash {
+		t.Fatal("legacy unsupported log stream snapshot would report drift after upgrade")
+	}
+}
+
+func TestLogStreamCredentialsAreRedacted(t *testing.T) {
+	raw, _, err := CanonicalFor("log_streaming", map[string]any{
+		"configuration": map[string]any{"stream": map[string]any{
+			"gcsCredentials":    `{"type":"external_account","private_key":"very-secret"}`,
+			"s3SecretAccessKey": "s3-secret",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "very-secret") || strings.Contains(string(raw), "s3-secret") {
+		t.Fatalf("log stream credentials were not redacted: %s", raw)
+	}
+}
+
+func TestUnavailableLogStreamStatusIsPreserved(t *testing.T) {
+	raw, _, err := CanonicalFor("log_streaming", map[string]any{
+		"configuration": map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{"state": HealthStatusUnavailable}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"state":"unavailable"`) {
+		t.Fatalf("unavailable status was normalized away: %s", raw)
 	}
 }

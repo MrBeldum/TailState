@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -230,14 +231,14 @@ func TestBoundedSnapshotsRetainHashAndTruncationMetadata(t *testing.T) {
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "small"},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	large := strings.Repeat("secret-free-value-", 500)
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": large},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, changed, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	var stored []byte
@@ -306,11 +307,11 @@ func TestHistoryPageReportsByteBudget(t *testing.T) {
 			ID: "device-1", Type: "device", Name: value, Data: map[string]any{"hostname": value},
 		}}}}
 	}
-	if _, err := testApplyBatch(st, ctx, generation, resource("baseline"), func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, resource("baseline"), notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 8; i++ {
-		if _, err := testApplyBatch(st, ctx, generation, resource(strings.Repeat("change", i+1)), func([]model.Change) string { return "changed" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, resource(strings.Repeat("change", i+1)), notify.TextDigest("changed")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -733,10 +734,10 @@ func TestStorageLimitPersistenceAndErrorEdges(t *testing.T) {
 		t.Fatalf("persisted limits = %#v found=%t err=%v, want %#v", got, found, err, valid)
 	}
 
-	if err := configureDatabasePageLimit(nil, valid.DatabaseBytes); err == nil {
+	if err := configureDatabasePageLimit(nil, nil, valid.DatabaseBytes); err == nil {
 		t.Fatal("nil database limit configuration unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(db, 0); err == nil {
+	if err := configureDatabasePageLimit(db, nil, 0); err == nil {
 		t.Fatal("zero database limit configuration unexpectedly succeeded")
 	}
 	if err := storageWriteError(nil); err != nil {
@@ -766,13 +767,13 @@ func TestStorageLimitPersistenceAndErrorEdges(t *testing.T) {
 	if err := persistStorageLimits(ctx, closed, valid); err == nil {
 		t.Fatal("persisting limits to closed database unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(closed, valid.DatabaseBytes); err == nil {
+	if err := configureDatabasePageLimit(closed, nil, valid.DatabaseBytes); err == nil {
 		t.Fatal("configuring closed database limit unexpectedly succeeded")
 	}
 	if _, _, err := loadPersistedStorageLimits(closed); err == nil {
 		t.Fatal("loading limits from closed database unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(db, 1); err == nil {
+	if err := configureDatabasePageLimit(db, nil, 1); err == nil {
 		t.Fatal("database limit below the existing page count unexpectedly succeeded")
 	}
 

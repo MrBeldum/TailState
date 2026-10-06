@@ -22,9 +22,18 @@ import (
 )
 
 var CoreCollectors = []string{"devices"}
-var InventoryCollectors = []string{"device_details", "users", "user_invites", "dns", "policy", "keys", "webhooks", "log_streaming", "contacts", "posture", "settings"}
+var InventoryCollectors = []string{"device_details", "users", "user_invites", "dns", "policy", "keys", "webhooks", "log_streaming", "contacts", "posture", "settings", "services", "oauth_apps"}
 
-type Credentials struct{ Tailnet, ClientID, ClientSecret string }
+// DefaultOAuthScope is requested when no scopes are configured.
+const DefaultOAuthScope = "all:read"
+
+// Credentials identify the OAuth client and tailnet. Scopes lists the OAuth
+// scopes requested for the access token; an empty list requests
+// DefaultOAuthScope.
+type Credentials struct {
+	Tailnet, ClientID, ClientSecret string
+	Scopes                          []string
+}
 
 // CollectionLimits bound the aggregate amount of data retained while a
 // paginated collection is assembled. The per-response limit in get is still
@@ -57,6 +66,13 @@ type Client struct {
 	deviceCache             []map[string]any
 	token                   string
 	expires                 time.Time
+	// detailMu guards the device-detail refresh order. detailAttempt records
+	// the poll sequence in which each device's detail requests last ran to
+	// completion so a deadline-limited poll starts with the stalest devices
+	// and every device is eventually refreshed.
+	detailMu      sync.Mutex
+	detailPoll    int64
+	detailAttempt map[string]int64
 }
 
 type HTTPError struct {
@@ -66,9 +82,10 @@ type HTTPError struct {
 }
 
 // PartialError reports a collector response that contained usable resources
-// but could not complete every related request. Count is the number of failed
-// related requests. Callers may apply the returned resources while preserving
-// existing snapshots for missing items.
+// but could not complete every related request. Count is the number of
+// resources missing from the response, including resources that were never
+// requested because a deadline expired. Callers may apply the returned
+// resources while preserving existing snapshots for missing items.
 type PartialError struct {
 	Err   error
 	Count int
@@ -157,6 +174,22 @@ func IsUnsupported(err error) bool {
 	return errors.As(err, &e) && (e.Status == http.StatusForbidden || e.Status == http.StatusNotFound)
 }
 
+// UnsupportedReason returns a bounded, operator-facing label for an
+// unsupported collector response. A 403 is what Tailscale returns both for a
+// plan without the feature and for an access token that lacks the scope, so
+// the label names both; a 404 means the endpoint or feature is not available
+// for this tailnet. Provider response text is never included.
+func UnsupportedReason(err error) string {
+	var e *HTTPError
+	if errors.As(err, &e) && e.Status == http.StatusForbidden {
+		return "unsupported (insufficient OAuth scope or plan: HTTP 403)"
+	}
+	if errors.As(err, &e) && e.Status == http.StatusNotFound {
+		return "unsupported (not available for this tailnet: HTTP 404)"
+	}
+	return "unsupported"
+}
+
 // IsUnsupportedCollector applies plan-capability semantics only to optional
 // collectors. Core device inventory and its dependent details must surface a
 // 404 as an upstream failure; otherwise a transient endpoint disappearance
@@ -196,7 +229,7 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 	case "device_details":
 		return c.deviceDetails(ctx)
 	case "users":
-		return c.collection(ctx, c.tailnet("users"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
+		return c.collection(ctx, c.tailnet("users?type=all"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
 	case "user_invites":
 		return c.collection(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
 	case "keys":
@@ -215,6 +248,13 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 		return c.collection(ctx, c.tailnet("posture/integrations"), "integrations", collector, "posture_integration", []string{"id", "integrationId", "integrationID"})
 	case "settings":
 		return c.single(ctx, c.tailnet("settings"), collector, "settings", "Tailnet settings")
+	case "services":
+		// Per-service hosts and approvals are not collected: Tailscale requires
+		// the write-capable "services" scope for those endpoints, which a
+		// read-only monitor must not hold.
+		return c.collection(ctx, c.tailnet("services"), "vipServices", collector, "service", []string{"name"})
+	case "oauth_apps":
+		return c.collection(ctx, c.tailnet("oauth-apps"), "oauthApps", collector, "oauth_app", []string{"id"})
 	default:
 		return nil, fmt.Errorf("unknown collector %q", collector)
 	}
@@ -269,6 +309,7 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		aggregateBytes += responseBytes
 		return nil
 	}
+	order := c.deviceDetailOrder(devices)
 	jobs := make(chan detailJob)
 	workers := min(deviceDetailWorkers, len(devices))
 	results := make(chan detailResult, max(1, workers))
@@ -285,11 +326,13 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 				}
 				combined := map[string]any{}
 				var detailErr error
+				// Routes are not fetched here: devices?fields=all already returns
+				// advertisedRoutes and enabledRoutes, so a routes sub-request
+				// would only report every route change a second time.
 				for _, detail := range []struct {
 					key  string
 					path string
 				}{
-					{key: "routes", path: "routes"},
 					{key: "postureAttributes", path: "attributes"},
 					{key: "deviceInvites", path: "device-invites"},
 				} {
@@ -336,9 +379,9 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	}
 	go func() {
 		defer close(jobs)
-		for index, device := range devices {
+		for _, index := range order {
 			select {
-			case jobs <- detailJob{index: index, device: device}:
+			case jobs <- detailJob{index: index, device: devices[index]}:
 			case <-detailCtx.Done():
 				return
 			}
@@ -349,17 +392,22 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		close(results)
 	}()
 	ordered := make([]detailResult, 0, len(devices))
+	completed := make([]int, 0, len(devices))
 	var partialErr error
-	partialCount := 0
 	for result := range results {
 		if result.err != nil {
-			partialCount++
+			// A request cancelled by the poll deadline was not really attempted;
+			// leave it at the front of the next poll's refresh order.
+			if ctx.Err() == nil {
+				completed = append(completed, result.index)
+			}
 			if partialErr == nil {
 				partialErr = result.err
 			}
 			continue
 		}
 		if result.hasValue {
+			completed = append(completed, result.index)
 			ordered = append(ordered, result)
 		}
 	}
@@ -374,10 +422,60 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	for _, result := range ordered {
 		out = append(out, result.resource)
 	}
-	if partialErr != nil {
-		return out, &PartialError{Err: partialErr, Count: partialCount}
+	c.recordDeviceDetailAttempts(devices, completed)
+	// Count every device missing from the result, including devices that were
+	// never dispatched because the deadline expired. A deadline must never look
+	// like a complete response.
+	if missing := len(devices) - len(out); missing > 0 {
+		if partialErr == nil {
+			cause := ctx.Err()
+			if cause == nil {
+				cause = errors.New("device detail results were incomplete")
+			}
+			partialErr = fmt.Errorf("device_details refreshed %d of %d devices before the poll deadline: %w", len(out), len(devices), cause)
+		}
+		return out, &PartialError{Err: partialErr, Count: missing}
 	}
 	return out, nil
+}
+
+// deviceDetailOrder returns device indexes ordered stalest-first: devices
+// whose detail requests have never completed come first, then the ones that
+// completed longest ago. Ties keep the API list order. A poll that hits its
+// deadline therefore resumes with the devices it could not reach instead of
+// starving the same tail of the list on every poll.
+func (c *Client) deviceDetailOrder(devices []map[string]any) []int {
+	order := make([]int, len(devices))
+	attempts := make([]int64, len(devices))
+	c.detailMu.Lock()
+	for index, device := range devices {
+		order[index] = index
+		attempts[index] = c.detailAttempt[idFor(device, []string{"id", "nodeId", "nodeID"})]
+	}
+	c.detailMu.Unlock()
+	sort.SliceStable(order, func(i, j int) bool { return attempts[order[i]] < attempts[order[j]] })
+	return order
+}
+
+// recordDeviceDetailAttempts marks the supplied device indexes as refreshed
+// in a new poll sequence and forgets devices that are no longer listed.
+func (c *Client) recordDeviceDetailAttempts(devices []map[string]any, completed []int) {
+	c.detailMu.Lock()
+	defer c.detailMu.Unlock()
+	c.detailPoll++
+	next := make(map[string]int64, len(devices))
+	for _, device := range devices {
+		id := idFor(device, []string{"id", "nodeId", "nodeID"})
+		if previous, ok := c.detailAttempt[id]; ok && id != "" {
+			next[id] = previous
+		}
+	}
+	for _, index := range completed {
+		if id := idFor(devices[index], []string{"id", "nodeId", "nodeID"}); id != "" {
+			next[id] = c.detailPoll
+		}
+	}
+	c.detailAttempt = next
 }
 
 func (c *Client) cacheDeviceResources(resources []model.Resource) {
@@ -412,11 +510,28 @@ func (c *Client) clearDeviceCache() {
 	c.deviceCacheMu.Unlock()
 }
 
+// dns reads the combined DNS configuration endpoint, which also reports
+// per-resolver useWithExitNode and the overrideLocalDNS preference. A 404
+// (an API without the endpoint) falls back to the four legacy endpoints. The
+// store compares the two shapes on the fields both can express, so switching
+// between them never reports drift by itself.
 func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
+	value, err := c.getObject(ctx, c.tailnet("dns/configuration"), "DNS configuration")
+	if err == nil {
+		return []model.Resource{{ID: "dns", Type: "dns", Name: "DNS configuration", Collector: "dns", Data: value}}, nil
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+		return c.legacyDNS(ctx)
+	}
+	return nil, err
+}
+
+func (c *Client) legacyDNS(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	supported := 0
 	for _, endpoint := range []string{"nameservers", "preferences", "searchpaths", "split-dns"} {
-		value, err := c.get(ctx, c.tailnet("dns/"+endpoint))
+		value, err := c.getObject(ctx, c.tailnet("dns/"+endpoint), "DNS "+endpoint)
 		if err != nil {
 			if IsUnsupported(err) {
 				data[endpoint] = map[string]any{"unsupported": true}
@@ -434,60 +549,91 @@ func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
 }
 
 func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
-	value, err := c.get(ctx, c.tailnet("acl"))
+	object, err := c.getObject(ctx, c.tailnet("acl"), "policy")
 	if err != nil {
 		return nil, err
 	}
 	sections := map[string]any{}
-	if object, ok := value.(map[string]any); ok {
-		for key, section := range object {
-			raw, _, _ := model.CanonicalForSection("policy", key, section)
-			sum := sha256.Sum256(raw)
-			sections[key] = hex.EncodeToString(sum[:])
-		}
-	} else {
-		raw, _, _ := model.Canonical(value)
+	for key, section := range object {
+		raw, _, _ := model.CanonicalForSection("policy", key, section)
 		sum := sha256.Sum256(raw)
-		sections["policy"] = hex.EncodeToString(sum[:])
+		sections[key] = hex.EncodeToString(sum[:])
 	}
 	return []model.Resource{{ID: "policy", Type: "policy", Name: "Tailnet policy", Collector: "policy", Data: sections}}, nil
 }
 
+// logStreaming collects both log-streaming kinds. Tailscale documents a 404
+// from /logging/{kind}/stream as "log streaming has not been configured" (the
+// same status is also used for an unsupported kind or insufficient access),
+// so a 404 is recorded as an explicit, diffable {"configured": false} state
+// rather than as a plan capability. Disabling a stream therefore produces a
+// change event instead of silently demoting the collector. Only a 403 for
+// every kind is treated as an unsupported collector.
 func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
-	supported := 0
+	forbidden := 0
 	for _, kind := range []string{"configuration", "network"} {
-		stream, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream"))
+		stream, err := c.getObject(ctx, c.tailnet("logging/"+kind+"/stream"), kind+" log stream")
 		if err != nil {
-			if IsUnsupported(err) {
-				data[kind] = map[string]any{"unsupported": true}
+			var httpErr *HTTPError
+			switch {
+			case errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound:
+				data[kind] = map[string]any{"configured": false}
+				continue
+			case errors.As(err, &httpErr) && httpErr.Status == http.StatusForbidden:
+				forbidden++
+				data[kind] = map[string]any{"configured": false}
 				continue
 			}
 			return nil, err
 		}
-		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream/status"))
+		var status any
+		status, err = c.getObject(ctx, c.tailnet("logging/"+kind+"/stream/status"), kind+" log stream status")
 		if err != nil {
-			if IsUnsupported(err) {
-				data[kind] = map[string]any{"unsupported": true}
-				continue
+			// The stream configuration was read successfully; a missing
+			// status or an unreachable logging backend must not discard it.
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || (httpErr.Status != http.StatusNotFound && httpErr.Status != http.StatusForbidden && httpErr.Status != http.StatusBadGateway) {
+				return nil, err
 			}
-			return nil, err
+			status = map[string]any{"state": logStreamStatusUnavailable}
 		}
-		supported++
 		data[kind] = map[string]any{"stream": stream, "status": status}
 	}
-	if supported == 0 {
-		return nil, &HTTPError{Status: http.StatusNotFound, URL: "logging", Body: "all log streaming endpoints unsupported"}
+	if forbidden == len(data) {
+		return nil, &HTTPError{Status: http.StatusForbidden, URL: "logging", Body: "log streaming endpoints forbidden"}
 	}
 	return []model.Resource{{ID: "log_streaming", Type: "log_streaming", Name: "Log streaming configuration", Collector: "log_streaming", Data: data}}, nil
 }
 
+// logStreamStatusUnavailable mirrors model.HealthStatusUnavailable; the
+// model package keeps it through status normalization.
+const logStreamStatusUnavailable = model.HealthStatusUnavailable
+
 func (c *Client) single(ctx context.Context, endpoint, collector, typ, name string) ([]model.Resource, error) {
-	value, err := c.get(ctx, endpoint)
+	value, err := c.getObject(ctx, endpoint, collector)
 	if err != nil {
 		return nil, err
 	}
 	return []model.Resource{{ID: collector, Type: typ, Name: name, Collector: collector, Data: value}}, nil
+}
+
+// getObject fetches a single-object endpoint. Settings, contacts, policy, the
+// DNS configuration and legacy DNS sub-endpoints, and log-streaming
+// configuration are always JSON objects;
+// an empty body, null, an array or a scalar is an invalid upstream response.
+// Returning an error keeps the last snapshot instead of replacing a baseline
+// with a degenerate value (and reporting the flip back as drift later).
+func (c *Client) getObject(ctx context.Context, endpoint, name string) (map[string]any, error) {
+	value, err := c.get(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	object, ok := value.(map[string]any)
+	if !ok || object == nil {
+		return nil, fmt.Errorf("tailscale %s response was not a JSON object", name)
+	}
+	return object, nil
 }
 
 func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {
@@ -581,9 +727,18 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 			}
 			out = append(out, obj)
 		}
-		candidate := ""
+		candidate, cursor := "", ""
 		if objectOK {
-			candidate = nextURL(object)
+			candidate, cursor = nextPage(object)
+		}
+		if cursor != "" {
+			// A bare cursor continues the current request: keep its existing
+			// query parameters (fields=all, all=true, type=...) and only
+			// replace the cursor.
+			candidate, err = withCursor(next, cursor)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if candidate == "" {
 			return out, nil
@@ -623,19 +778,34 @@ func (c *Client) resolvePaginationURL(current, candidate string) (string, error)
 	return pageURL.String(), nil
 }
 
-func nextURL(object map[string]any) string {
+// nextPage returns either an explicit next-page link or a bare pagination
+// cursor from a collection response.
+func nextPage(object map[string]any) (link, cursor string) {
 	if value, ok := object["next"].(string); ok {
-		return value
+		return value, ""
 	}
 	if p, ok := object["pagination"].(map[string]any); ok {
 		if value, ok := p["next"].(string); ok {
-			return value
+			return value, ""
 		}
 		if cursor, ok := p["nextCursor"].(string); ok && cursor != "" {
-			return "?cursor=" + url.QueryEscape(cursor)
+			return "", cursor
 		}
 	}
-	return ""
+	return "", ""
+}
+
+// withCursor merges a pagination cursor into the current page URL without
+// dropping its other query parameters.
+func withCursor(current, cursor string) (string, error) {
+	currentURL, err := url.Parse(current)
+	if err != nil {
+		return "", fmt.Errorf("invalid current pagination URL: %w", err)
+	}
+	query := currentURL.Query()
+	query.Set("cursor", cursor)
+	currentURL.RawQuery = query.Encode()
+	return currentURL.String(), nil
 }
 
 func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
@@ -652,6 +822,12 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 	for attempt := 0; attempt < 4; attempt++ {
 		token, err := c.accessToken(retryCtx)
 		if err != nil {
+			// A token-endpoint blip (network error, 429 or 5xx) must not fail
+			// every request that happens to need a fresh token. Retry it within
+			// the same per-request budget.
+			if delay, transient := transientTokenDelay(err, attempt); transient && attempt < 3 && waitWithinBudget(retryCtx, delay) {
+				continue
+			}
 			return nil, 0, err
 		}
 		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
@@ -692,6 +868,15 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 			}
 			continue
 		}
+		if transientGatewayStatus(resp.StatusCode) && attempt < 3 {
+			// Tailscale documents 502/503/504 as "try again later". Retry with
+			// backoff (or the provider's Retry-After) while the request budget
+			// allows; otherwise report the upstream status unchanged.
+			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
+			if waitWithinBudget(retryCtx, delay) {
+				continue
+			}
+		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, int64(len(body)), &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
 		}
@@ -704,7 +889,59 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		}
 		return value, int64(len(body)), nil
 	}
-	return nil, 0, errors.New("tailscale request retries exhausted")
+	return nil, 0, errRetriesExhausted
+}
+
+var errRetriesExhausted = errors.New("tailscale request retries exhausted")
+
+// oauthStatusError reports a non-2xx token endpoint response.
+type oauthStatusError struct {
+	Status     int
+	RetryAfter string
+}
+
+func (e *oauthStatusError) Error() string {
+	return fmt.Sprintf("OAuth token request returned %d", e.Status)
+}
+
+// oauthTransportError reports a token request that failed before a response
+// was received.
+type oauthTransportError struct{ Err error }
+
+func (e *oauthTransportError) Error() string { return e.Err.Error() }
+func (e *oauthTransportError) Unwrap() error { return e.Err }
+
+func transientGatewayStatus(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// transientTokenDelay classifies token endpoint failures that are worth
+// retrying and returns the delay before the next attempt.
+func transientTokenDelay(err error, attempt int) (time.Duration, bool) {
+	fallback := time.Duration(1<<attempt) * time.Second
+	var statusErr *oauthStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.Status == http.StatusTooManyRequests || statusErr.Status >= 500 {
+			return retryAfter(statusErr.RetryAfter, fallback), true
+		}
+		return 0, false
+	}
+	var transportErr *oauthTransportError
+	if errors.As(err, &transportErr) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fallback, true
+	}
+	return 0, false
+}
+
+// waitWithinBudget sleeps before a retry only when the retry can still start
+// inside the request's deadline. It reports false without sleeping when the
+// delay would exhaust the budget, so the caller returns the upstream error
+// instead of a less useful context deadline error.
+func waitWithinBudget(ctx context.Context, delay time.Duration) bool {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+		return false
+	}
+	return waitForRetry(ctx, delay)
 }
 
 func (c *Client) accessToken(ctx context.Context) (string, error) {
@@ -713,7 +950,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	if c.token != "" && time.Until(c.expires) > 5*time.Minute {
 		return c.token, nil
 	}
-	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"all:read"}, "client_id": {c.credentials.ClientID}, "client_secret": {c.credentials.ClientSecret}}
+	form := url.Values{"grant_type": {"client_credentials"}, "scope": {c.scope()}, "client_id": {c.credentials.ClientID}, "client_secret": {c.credentials.ClientSecret}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
@@ -722,7 +959,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	req.SetBasicAuth(c.credentials.ClientID, c.credentials.ClientSecret)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", &oauthTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseBytes+1))
@@ -733,7 +970,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("OAuth response exceeds %d bytes", maxOAuthResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("OAuth token request returned %d", resp.StatusCode)
+		return "", &oauthStatusError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
 	}
 	var payload struct {
 		AccessToken string `json:"access_token"`
@@ -751,6 +988,20 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	c.token = payload.AccessToken
 	c.expires = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	return c.token, nil
+}
+
+// scope returns the space-separated OAuth scope parameter.
+func (c *Client) scope() string {
+	scopes := make([]string, 0, len(c.credentials.Scopes))
+	for _, scope := range c.credentials.Scopes {
+		if scope = strings.TrimSpace(scope); scope != "" {
+			scopes = append(scopes, scope)
+		}
+	}
+	if len(scopes) == 0 {
+		return DefaultOAuthScope
+	}
+	return strings.Join(scopes, " ")
 }
 
 func (c *Client) tailnet(suffix string) string {

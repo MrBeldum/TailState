@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,52 +27,25 @@ import (
 var version = "dev"
 
 func main() {
+	restrictFileCreationMask()
 	if err := run(); err != nil {
-		slog.Error("TailState stopped", "error", err)
-		os.Exit(1)
+		os.Exit(reportError(os.Stderr, err))
 	}
 }
 
+// run dispatches os.Args. Logging is configured first so every later log
+// record, including configuration errors and store migration progress, is
+// JSON at the configured level. serve logs to standard output as before;
+// other commands log to standard error so their standard output stays
+// machine-readable.
 func run() error {
-	command := "serve"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
+	args := os.Args[1:]
+	if len(args) == 0 || args[0] == "serve" {
+		configureLogging(os.Stdout)
+	} else {
+		configureLogging(os.Stderr)
 	}
-	switch command {
-	case "serve":
-		return serve()
-	case "healthcheck":
-		return healthcheck(os.Args[2:])
-	case "doctor":
-		return doctor(os.Args[2:])
-	case "admin":
-		if len(os.Args) > 2 {
-			switch os.Args[2] {
-			case "reset":
-				return adminReset()
-			case "rekey":
-				return adminRekey(os.Args[3:])
-			}
-		}
-		return errors.New("usage: tailstate admin reset or tailstate admin rekey -new-key-file PATH")
-	case "evidence":
-		if len(os.Args) > 2 {
-			switch os.Args[2] {
-			case "verify":
-				return evidenceVerify(os.Args[3:])
-			case "audit":
-				return evidenceAudit(os.Args[3:])
-			case "public-key":
-				return evidencePublicKey()
-			}
-		}
-		return errors.New("usage: tailstate evidence audit [-public-key public.key] [-batch-size N], evidence verify [-file evidence.json] [-public-key public.key], or tailstate evidence public-key")
-	case "version", "--version", "-version":
-		fmt.Printf("tailstate %s\n", version)
-		return nil
-	default:
-		return fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, evidence audit, evidence verify, evidence public-key, or version)", command)
-	}
+	return dispatch(args)
 }
 
 func load() (boot.Config, *store.Store, error) {
@@ -99,28 +71,65 @@ func load() (boot.Config, *store.Store, error) {
 	return config, st, err
 }
 
+// serveBaseContext and startEngine are test seams for the serve lifecycle.
+var (
+	serveBaseContext = context.Background
+	startEngine      = func(ctx context.Context, engine *monitor.Engine) { engine.Run(ctx) }
+)
+
 func serve() error {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(serveBaseContext(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return serveContext(ctx)
 }
 
 func serveContext(ctx context.Context) error {
+	// Hold the service lock for the process lifetime so offline maintenance
+	// (admin compact) refuses to run while the service is up. The kernel
+	// drops it if the process dies.
+	config, err := boot.Load(version)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(config.DataDir, 0o700); err != nil {
+		return err
+	}
+	lock, err := store.LockService(config.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 	config, st, err := load()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	level := slog.LevelInfo
-	if config.LogLevel == "debug" {
-		level = slog.LevelDebug
-	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
-	if config.InsecureHTTPListener() {
+	if config.ContainerWildcardListener() {
+		slog.Info("container listener accepts connections on all container interfaces; the published host port controls exposure")
+	} else if config.InsecureHTTPListener() {
 		slog.Warn("authenticated UI is exposed on a non-loopback plaintext listener; configure TAILSTATE_COOKIE_SECURE=true behind a trusted HTTPS proxy or bind TAILSTATE_LISTEN_ADDR to loopback")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	engine := monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, version)
+	engine.ConfigureNotifications(config.InstanceLabel, config.PublicURL)
+	server, err := webui.New(config, st, engine)
+	if err != nil {
+		return err
+	}
+	// Bind before any startup write or engine work: an address conflict
+	// must stop the process before a collector polls or a notification is
+	// delivered (or the version-update notification is queued).
+	listener, err := server.Listen()
+	if err != nil {
+		return err
+	}
+	serving := false
+	defer func() {
+		if !serving {
+			_ = listener.Close()
+		}
+	}()
 	exists, err := st.AdminExists(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -138,7 +147,15 @@ func serveContext(ctx context.Context) error {
 		}
 		slog.Warn("installation is unclaimed; open /setup and use the one-time setup token", "setup_token", token)
 	}
-	notified, err := st.TrackAppVersion(ctx, version, notify.Update)
+	// The tailnet is only needed for the update notification's context; an
+	// unconfigured installation queues no notification.
+	messages := notify.Context{Label: config.InstanceLabel, PublicURL: config.PublicURL, Version: version}
+	if settings, settingsErr := st.Settings(ctx); settingsErr == nil {
+		messages.Tailnet = settings.Tailnet
+	}
+	notified, err := st.TrackAppVersion(ctx, version, func(previous, current string) notify.Message {
+		return messages.Update(previous, current, time.Now())
+	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
@@ -148,17 +165,13 @@ func serveContext(ctx context.Context) error {
 	if notified {
 		slog.Info("TailState update notification queued", "version", version)
 	}
-	engine := monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, version)
-	engine.Run(ctx)
+	startEngine(ctx, engine)
 	defer func() {
 		cancel()
 		engine.Wait()
 	}()
-	server, err := webui.New(config, st, engine)
-	if err != nil {
-		return err
-	}
-	if err := server.Serve(ctx); errors.Is(err, context.Canceled) {
+	serving = true
+	if err := server.ServeListener(ctx, listener); errors.Is(err, context.Canceled) {
 		return nil
 	} else {
 		return err
@@ -166,13 +179,25 @@ func serveContext(ctx context.Context) error {
 }
 
 func healthcheck(args []string) error {
-	flags := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
-	url := flags.String("url", "http://127.0.0.1:8080/healthz", "health endpoint URL")
-	if err := flags.Parse(args); err != nil {
+	flags := newFlagSet("healthcheck")
+	url := flags.String("url", "", "health endpoint URL (default: derived from TAILSTATE_LISTEN_ADDR)")
+	if done, err := parseFlags("healthcheck", flags, args); done {
 		return err
 	}
+	target := strings.TrimSpace(*url)
+	if target == "" {
+		listen, ok := os.LookupEnv("TAILSTATE_LISTEN_ADDR")
+		if !ok {
+			listen = "127.0.0.1:8080"
+		}
+		derived, err := healthcheckURL(listen)
+		if err != nil {
+			return err
+		}
+		target = derived
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(*url)
+	resp, err := client.Get(target)
 	if err != nil {
 		return err
 	}
@@ -184,9 +209,9 @@ func healthcheck(args []string) error {
 }
 
 func doctor(args []string) error {
-	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags := newFlagSet("doctor")
 	jsonOutput := flags.Bool("json", false, "write the report as JSON")
-	if err := flags.Parse(args); err != nil {
+	if done, err := parseFlags("doctor", flags, args); done {
 		return err
 	}
 	config, err := boot.Load(version)
@@ -262,6 +287,9 @@ func doctor(args []string) error {
 	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
 		runtime.Storage.DatabaseLimitBytes = storage.DatabaseLimitBytes
 		runtime.Storage.DatabaseBytes = storage.DatabaseBytes
+		runtime.Storage.DatabaseUsedBytes = storage.DatabaseUsedBytes
+		runtime.Storage.DatabaseFreelistPages = storage.DatabaseFreelistPages
+		runtime.Storage.DatabaseFreeBytes = storage.DatabaseFreeBytes
 		runtime.Storage.DatabaseFileBytes = storage.DatabaseFileBytes
 		runtime.Storage.DatabaseWALBytes = storage.DatabaseWALBytes
 		runtime.Storage.DatabaseSHMBytes = storage.DatabaseSHMBytes
@@ -300,7 +328,8 @@ func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
 		} else if report.SchemaVersion > 0 {
 			fmt.Fprintf(os.Stdout, "Database schema: %d\n", report.SchemaVersion)
 		}
-		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
+		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes used (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseUsedBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
+		fmt.Fprintf(os.Stdout, "Allocated: %d bytes, of which %d bytes in %d free pages\n", report.Storage.DatabaseBytes, report.Storage.DatabaseFreeBytes, report.Storage.DatabaseFreelistPages)
 		if report.Storage.ConfiguredProfile != nil {
 			fmt.Fprintf(os.Stdout, "Configured storage profile: snapshot %d, event %d, history page %d, reject %d, database %d bytes\n", report.Storage.ConfiguredProfile.SnapshotLimitBytes, report.Storage.ConfiguredProfile.EventValueLimitBytes, report.Storage.ConfiguredProfile.HistoryPageLimitBytes, report.Storage.ConfiguredProfile.RejectLimitBytes, report.Storage.ConfiguredProfile.DatabaseLimitBytes)
 		}
@@ -316,13 +345,38 @@ func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
 		}
 	}
 	if report.HasErrors() {
-		return errors.New("doctor found blocking deployment issues")
+		return findingsError(errors.New("doctor found blocking deployment issues"))
 	}
 	return nil
 }
 
+// openExisting opens the configured database for a narrow administrative
+// write without creating, migrating, or otherwise rewriting it.
+func openExisting(command string) (*store.Store, error) {
+	config, err := boot.Load(version)
+	if err != nil {
+		return nil, fmt.Errorf("%s configuration: %w", command, err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return nil, fmt.Errorf("%s master key: %w", command, err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return nil, fmt.Errorf("%s master key: %w", command, err)
+	}
+	st, err := store.OpenExisting(config.DatabasePath(), box)
+	if err != nil {
+		return nil, fmt.Errorf("%s database: %w", command, err)
+	}
+	return st, nil
+}
+
 func adminReset() error {
-	_, st, err := load()
+	// Reset must work while serve is running and must never create or
+	// migrate a database (a mistyped data directory or a newer image would
+	// otherwise do so silently); it writes only the reset token row.
+	st, err := openExisting("admin reset")
 	if err != nil {
 		return err
 	}
@@ -336,13 +390,13 @@ func adminReset() error {
 }
 
 func adminRekey(args []string) error {
-	flags := flag.NewFlagSet("admin rekey", flag.ContinueOnError)
+	flags := newFlagSet("admin rekey")
 	newKeyFile := flags.String("new-key-file", "", "path to the replacement raw or base64 master-key file")
-	if err := flags.Parse(args); err != nil {
+	if done, err := parseFlags("admin rekey", flags, args); done {
 		return err
 	}
 	if strings.TrimSpace(*newKeyFile) == "" {
-		return errors.New("-new-key-file is required")
+		return usageError("admin rekey", errors.New("-new-key-file is required"))
 	}
 	_, st, err := load()
 	if err != nil {
@@ -364,11 +418,67 @@ func adminRekey(args []string) error {
 	return nil
 }
 
+func adminBackup(args []string) error {
+	flags := newFlagSet("admin backup")
+	out := flags.String("out", "", "snapshot file to create (must not exist); FILE.sha256 is written beside it")
+	if done, err := parseFlags("admin backup", flags, args); done {
+		return err
+	}
+	if strings.TrimSpace(*out) == "" {
+		return usageError("admin backup", errors.New("-out is required"))
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("admin backup configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("admin backup master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("admin backup master key: %w", err)
+	}
+	result, err := store.Backup(context.Background(), config.DatabasePath(), box, *out)
+	if err != nil {
+		return fmt.Errorf("admin backup: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "TailState backup written: %s (%d bytes, schema %d)\nSHA-256: %s (%s)\nKeep the matching master key; the snapshot is unusable without it.\n", result.Path, result.Bytes, result.SchemaVersion, result.SHA256, result.ChecksumPath)
+	return nil
+}
+
+func adminCompact(args []string) error {
+	flags := newFlagSet("admin compact")
+	incremental := flags.Bool("incremental-vacuum", false, "also switch the database to auto_vacuum=INCREMENTAL so later cleanup passes release free pages")
+	if done, err := parseFlags("admin compact", flags, args); done {
+		return err
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("admin compact configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("admin compact master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("admin compact master key: %w", err)
+	}
+	result, err := store.Compact(context.Background(), config.DatabasePath(), box, store.CompactOptions{IncrementalVacuum: *incremental})
+	if err != nil {
+		return fmt.Errorf("admin compact: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "TailState database compacted: %d -> %d bytes (%d -> %d pages, %d free pages released); incremental auto-vacuum %t\n",
+		result.PagesBefore*result.PageSize, result.PagesAfter*result.PageSize, result.PagesBefore, result.PagesAfter, result.FreePagesBefore-result.FreePagesAfter, result.AutoVacuumEnabled)
+	return nil
+}
+
 func evidenceVerify(args []string) error {
-	flags := flag.NewFlagSet("evidence verify", flag.ContinueOnError)
+	flags := newFlagSet("evidence verify")
 	file := flags.String("file", "-", "evidence pack path, or - to read standard input")
 	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key path (base64, hexadecimal, or raw)")
-	if err := flags.Parse(args); err != nil {
+	if done, err := parseFlags("evidence verify", flags, args); done {
 		return err
 	}
 	var data []byte
@@ -391,12 +501,12 @@ func evidenceVerify(args []string) error {
 			return fmt.Errorf("parse evidence public key: %w", err)
 		}
 		if err := store.VerifyEvidencePackWithKey(data, publicKey); err != nil {
-			return err
+			return findingsError(err)
 		}
 	} else if err := store.VerifyEvidencePack(data); err != nil {
-		return err
+		return findingsError(err)
 	}
-	// Verification only accepts the signed v3 format. Keep the success output
+	// Verification only accepts the signed v3 and v4 formats. Keep the success output
 	// explicit so operators and scripts cannot confuse it with an unsigned
 	// legacy export (which this command deliberately rejects).
 	fmt.Println("signed evidence pack verified")
@@ -404,10 +514,10 @@ func evidenceVerify(args []string) error {
 }
 
 func evidenceAudit(args []string) error {
-	flags := flag.NewFlagSet("evidence audit", flag.ContinueOnError)
+	flags := newFlagSet("evidence audit")
 	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key path (base64, hexadecimal, or raw)")
 	batchSize := flags.Int("batch-size", 128, "maximum ledger entries read per page")
-	if err := flags.Parse(args); err != nil {
+	if done, err := parseFlags("evidence audit", flags, args); done {
 		return err
 	}
 	config, err := boot.Load(version)
@@ -444,6 +554,10 @@ func evidenceAudit(args []string) error {
 	for {
 		result, err := st.AuditEvidenceLedger(context.Background(), store.EvidenceAuditOptions{Cursor: cursor, Limit: *batchSize, TrustedPublicKey: trustedKey})
 		if err != nil {
+			var auditErr *store.EvidenceAuditError
+			if errors.As(err, &auditErr) {
+				return findingsError(fmt.Errorf("evidence ledger audit: %w", err))
+			}
 			return fmt.Errorf("evidence ledger audit: %w", err)
 		}
 		entries += result.Entries
@@ -484,9 +598,24 @@ func readEvidenceInput(input io.Reader, limit int64, tooLarge error) ([]byte, er
 }
 
 func evidencePublicKey() error {
-	_, st, err := load()
+	// Read-only: a missing database, an older schema, or a missing signing
+	// key is an error. This command must never create a database or a fresh
+	// key that an operator could mistake for the instance's trusted key.
+	config, err := boot.Load(version)
 	if err != nil {
-		return err
+		return fmt.Errorf("evidence public-key configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("evidence public-key master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("evidence public-key master key: %w", err)
+	}
+	st, err := store.OpenEvidenceReadOnly(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("evidence public-key database: %w", err)
 	}
 	defer st.Close()
 	public, err := st.EvidenceSigningPublicKey(context.Background())

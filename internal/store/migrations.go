@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
@@ -48,11 +50,13 @@ func verifyLegacyMasterKey(db *sql.DB, box *secret.Box) error {
 			if !available[column] {
 				continue
 			}
-			rows, queryErr := db.Query("SELECT " + column + " FROM " + table.name)
+			// rowid equals the INTEGER PRIMARY KEY id of both tables, which is
+			// the row key in their encryption bindings.
+			rows, queryErr := db.Query("SELECT rowid," + column + " FROM " + table.name)
 			if queryErr != nil {
 				return fmt.Errorf("read encrypted %s.%s: %w", table.name, column, queryErr)
 			}
-			if err := verifyEncryptedRows(rows, box); err != nil {
+			if err := verifyEncryptedRows(rows, box, table.name+"."+column); err != nil {
 				return fmt.Errorf("verify encrypted %s.%s: %w", table.name, column, err)
 			}
 		}
@@ -63,11 +67,11 @@ func verifyLegacyMasterKey(db *sql.DB, box *secret.Box) error {
 		return fmt.Errorf("inspect meta schema: %w", err)
 	}
 	if present && available["key"] && available["value"] {
-		rows, queryErr := db.Query("SELECT value FROM meta WHERE key IN ('master_key_check','evidence_signing_private_key_enc')")
+		rows, queryErr := db.Query("SELECT key,value FROM meta WHERE key IN ('master_key_check','evidence_signing_private_key_enc')")
 		if queryErr != nil {
 			return fmt.Errorf("read encrypted meta values: %w", queryErr)
 		}
-		if err := verifyEncryptedRows(rows, box); err != nil {
+		if err := verifyEncryptedRows(rows, box, "meta.value"); err != nil {
 			return fmt.Errorf("verify encrypted meta values: %w", err)
 		}
 	}
@@ -153,17 +157,21 @@ func tableColumns(db *sql.DB, table string) (bool, map[string]bool, error) {
 	return true, columns, nil
 }
 
-func verifyEncryptedRows(rows *sql.Rows, box *secret.Box) error {
+// verifyEncryptedRows authenticates (row key, envelope) rows against the
+// binding "<location>:<row key>". Legacy v1 envelopes carry no binding and are
+// checked against the key alone.
+func verifyEncryptedRows(rows *sql.Rows, box *secret.Box, location string) error {
 	defer rows.Close()
 	for rows.Next() {
+		var rowKey string
 		var encrypted sql.NullString
-		if err := rows.Scan(&encrypted); err != nil {
+		if err := rows.Scan(&rowKey, &encrypted); err != nil {
 			return err
 		}
 		if strings.TrimSpace(encrypted.String) == "" {
 			continue
 		}
-		if _, err := box.Decrypt(encrypted.String); err != nil {
+		if _, err := box.Open(location+":"+rowKey, encrypted.String); err != nil {
 			return errors.New("master key does not match this database")
 		}
 	}
@@ -248,6 +256,18 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 12 {
+		if err := migrateSchemaV12ToV13(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 13 {
+		if err := migrateSchemaV13ToV14(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -306,7 +326,7 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	var destinationID int64
 	if legacyEnc != "" {
-		legacyURL, err := box.Decrypt(legacyEnc)
+		legacyURL, err := box.Open(settingsBinding("mattermost_url_enc"), legacyEnc)
 		if err != nil {
 			return fmt.Errorf("decrypt legacy Mattermost setting: %w", err)
 		}
@@ -314,18 +334,10 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		if err != nil {
 			return fmt.Errorf("migrate legacy Mattermost setting: %w", err)
 		}
-		convertedEnc, err := box.Encrypt(converted)
-		if err != nil {
-			return fmt.Errorf("encrypt migrated notification destination: %w", err)
-		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		result, err := tx.Exec("INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)", "Mattermost", convertedEnc, now, now)
+		destinationID, err = insertDestinationTx(context.Background(), tx, box, "Mattermost", converted, true, now)
 		if err != nil {
 			return fmt.Errorf("store migrated notification destination: %w", err)
-		}
-		destinationID, err = result.LastInsertId()
-		if err != nil {
-			return err
 		}
 		if _, err := tx.Exec("UPDATE outbox SET destination_id=? WHERE destination_id IS NULL", destinationID); err != nil {
 			return fmt.Errorf("assign migrated outbox rows: %w", err)
@@ -746,6 +758,158 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 			return fmt.Errorf("invalid bounded history migration phase %q", phase)
 		}
 	}
+}
+
+// migrateSchemaV12ToV13 hardens persisted state without changing any table
+// layout. It scrubs the encrypted service URL of destinations that were
+// soft-deleted before deletion started clearing it, drops two indexes that
+// duplicate another index (events_observed_at is a prefix of
+// events_retention because id is the rowid; evidence_ledger_batch_id
+// duplicates the UNIQUE constraint's index), and adds the indexes that let
+// every retention statement use an index search without a temporary sort.
+func migrateSchemaV12ToV13(db *sql.DB) error {
+	ctx := context.Background()
+	err := withSecureDelete(ctx, db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='' WHERE deleted_at IS NOT NULL AND service_url_enc<>''"); err != nil {
+			return fmt.Errorf("scrub deleted notification destinations: %w", err)
+		}
+		for _, statement := range []string{
+			"DROP INDEX IF EXISTS events_observed_at",
+			"DROP INDEX IF EXISTS evidence_ledger_batch_id",
+			"CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)",
+			"CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)",
+		} {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("update retention indexes: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=13"); err != nil {
+			return fmt.Errorf("record persistence hardening migration: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("persistence hardening migration: %w", err)
+	}
+	return nil
+}
+
+// migrateSchemaV13ToV14 adds notification routing, classification, noise
+// control, and per-service rendering state. Every new column defaults to the
+// pre-upgrade behaviour: destinations route all changes, choose their format
+// from the URL scheme, no event is muted, and queued outbox rows keep their
+// pre-rendered Markdown. Existing events are
+// classified in bounded, resumable chunks; severity is derived data and is
+// not part of the signed evidence ledger payload, and the ledger records the
+// muted flag only when it is set, so neither can change an existing digest.
+func migrateSchemaV13ToV14(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin notification routing migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "notification_destinations", name: "route_min_severity", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_include_collectors", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_exclude_collectors", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_change_kinds", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "severity", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "muted", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "notification_destinations", name: "message_format", definition: "TEXT NOT NULL DEFAULT ''"},
+		// Existing rows hold pre-rendered Markdown and keep being delivered
+		// unchanged; new rows store a format-neutral message.
+		{table: "outbox", name: "payload_format", definition: "TEXT NOT NULL DEFAULT 'markdown'"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit notification routing columns: %w", err)
+	}
+	var cursor int64
+	for {
+		next, done, err := migrateEventSeverityChunk(db, cursor)
+		if err != nil {
+			return err
+		}
+		if done {
+			break
+		}
+		cursor = next
+	}
+	finalTx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin notification routing migration completion: %w", err)
+	}
+	defer finalTx.Rollback()
+	if _, err := finalTx.Exec(`CREATE TABLE IF NOT EXISTS mute_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		kind TEXT NOT NULL CHECK(kind IN ('collector','field','tag','resource')),
+		value TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		UNIQUE(kind, value)
+	)`); err != nil {
+		return fmt.Errorf("create mute rules: %w", err)
+	}
+	if _, err := finalTx.Exec("UPDATE schema_version SET version=14"); err != nil {
+		return fmt.Errorf("record notification routing migration: %w", err)
+	}
+	if err := finalTx.Commit(); err != nil {
+		return fmt.Errorf("commit notification routing migration: %w", err)
+	}
+	return nil
+}
+
+// migrateEventSeverityChunk classifies up to migrationChunkSize unclassified
+// events after cursor in one transaction. Rerunning it after an interruption
+// only revisits events that are still unclassified.
+func migrateEventSeverityChunk(db *sql.DB, cursor int64) (int64, bool, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return cursor, false, fmt.Errorf("begin event severity backfill: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query("SELECT id,collector,event_type,changes_json FROM events WHERE id>? AND severity='' ORDER BY id LIMIT ?", cursor, migrationChunkSize)
+	if err != nil {
+		return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+	}
+	type pending struct {
+		id       int64
+		severity model.Severity
+	}
+	var items []pending
+	for rows.Next() {
+		var id int64
+		var collector, kind string
+		var changes []byte
+		if err := rows.Scan(&id, &collector, &kind, &changes); err != nil {
+			rows.Close()
+			return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+		}
+		items = append(items, pending{id: id, severity: classifyStoredEvent(collector, kind, changes)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return cursor, false, err
+	}
+	if len(items) == 0 {
+		return cursor, true, nil
+	}
+	for _, item := range items {
+		if _, err := tx.Exec("UPDATE events SET severity=? WHERE id=?", string(item.severity), item.id); err != nil {
+			return cursor, false, fmt.Errorf("record event severity: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return cursor, false, fmt.Errorf("commit event severity backfill: %w", err)
+	}
+	return items[len(items)-1].id, false, nil
 }
 
 type snapshotMetadataMigrationRow struct {

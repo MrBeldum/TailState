@@ -39,9 +39,12 @@ type evidenceSigningKey struct {
 	keyID   string
 }
 
-// evidenceLedgerLinks returns the complete chain segment spanning the
-// selected batches. Filtered exports can therefore verify links for batches
-// that are not included in the event payload itself.
+// evidenceLedgerLinks returns the chain segment spanning the selected
+// batches. Filtered exports can therefore verify links for batches that are
+// not included in the event payload itself. At most evidenceLedgerLinkLimit
+// links are returned, newest sequences first in the read and ascending in the
+// result: when the span is longer, the segment stops short of the oldest
+// selected batches and the exporter leaves those batches for the next part.
 func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch) ([]EvidenceLedgerLink, error) {
 	var minSequence, maxSequence int64
 	for _, batch := range batches {
@@ -62,39 +65,41 @@ func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch)
 	// A filtered or paginated export may start in the middle of the ledger; the
 	// predecessor lets an offline verifier distinguish a valid range boundary
 	// from a broken chain without exposing the predecessor's event payload.
-	startSequence := minSequence
-	if startSequence > 1 {
-		startSequence--
-	}
+	startSequence := ledgerCheckpointSequence(minSequence)
+	limit := min(int64(evidenceLedgerLinkLimit), maxSequence-startSequence+1)
 	rows, err := s.db.QueryContext(ctx, `SELECT sequence,batch_id,prev_hash,entry_hash,signature,key_id
-		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence`, startSequence, maxSequence)
+		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence DESC LIMIT ?`, startSequence, maxSequence, limit)
 	if err != nil {
 		return nil, err
 	}
-	// The size guard below can return before the normal rows.Close path. Keep
-	// the connection release unconditional so an oversized export cannot leak
-	// a SQLite rows handle and stall later history requests.
 	defer rows.Close()
-	links := make([]EvidenceLedgerLink, 0, min(maxEvidenceLedgerLinks, int(maxSequence-startSequence+1)))
+	links := make([]EvidenceLedgerLink, 0, limit)
 	for rows.Next() {
-		if len(links) >= maxEvidenceLedgerLinks {
-			return nil, ErrEvidencePackTooLarge
-		}
 		var link EvidenceLedgerLink
 		if err := rows.Scan(&link.Sequence, &link.BatchID, &link.PrevHash, &link.EntryHash, &link.Signature, &link.KeyID); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		links = append(links, link)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	for left, right := 0, len(links)-1; left < right; left, right = left+1, right-1 {
+		links[left], links[right] = links[right], links[left]
+	}
 	return links, nil
+}
+
+// ledgerCheckpointSequence is the first ledger sequence an export must carry
+// for a range whose oldest batch has the given sequence.
+func ledgerCheckpointSequence(sequence int64) int64 {
+	if sequence > 1 {
+		return sequence - 1
+	}
+	return sequence
 }
 
 type ledgerQueryer interface {
@@ -123,6 +128,9 @@ type evidenceLedgerEvent struct {
 	Changes    string `json:"changes,omitempty"`
 	Before     string `json:"before,omitempty"`
 	After      string `json:"after,omitempty"`
+	// Muted is recorded only when set, so entries signed before mute rules
+	// existed (and unmuted entries) keep their original payload bytes.
+	Muted bool `json:"muted,omitempty"`
 }
 
 func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret.Box) (evidenceSigningKey, error) {
@@ -143,7 +151,7 @@ func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret
 		if err != nil {
 			return evidenceSigningKey{}, fmt.Errorf("generate evidence signing key: %w", err)
 		}
-		privateEnvelope, err := box.Encrypt(base64.RawStdEncoding.EncodeToString(private))
+		privateEnvelope, err := box.Seal(metaBinding(evidenceSigningPrivateKeyMeta), base64.RawStdEncoding.EncodeToString(private))
 		if err != nil {
 			return evidenceSigningKey{}, fmt.Errorf("encrypt evidence signing key: %w", err)
 		}
@@ -171,7 +179,7 @@ func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret
 	if len(values) != 3 {
 		return evidenceSigningKey{}, errors.New("evidence signing key metadata is incomplete")
 	}
-	privateEncoded, err := box.Decrypt(values[evidenceSigningPrivateKeyMeta])
+	privateEncoded, err := box.Open(metaBinding(evidenceSigningPrivateKeyMeta), values[evidenceSigningPrivateKeyMeta])
 	if err != nil {
 		return evidenceSigningKey{}, fmt.Errorf("decrypt evidence signing key: %w", err)
 	}
@@ -465,18 +473,20 @@ func evidenceLedgerPayload(ctx context.Context, queryer ledgerQueryer, batchID i
 	if len(batch.TriggerIDs) == 0 && batch.TriggerID > 0 {
 		batch.TriggerIDs = []int64{batch.TriggerID}
 	}
-	eventRows, err := queryer.QueryContext(ctx, `SELECT id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json FROM events WHERE batch_id=? ORDER BY id`, batchID)
+	eventRows, err := queryer.QueryContext(ctx, `SELECT id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,muted FROM events WHERE batch_id=? ORDER BY id`, batchID)
 	if err != nil {
 		return nil, evidenceLedgerBatch{}, err
 	}
 	for eventRows.Next() {
 		var event evidenceLedgerEvent
 		var changes, before, after []byte
-		if err := eventRows.Scan(&event.ID, &event.Generation, &event.ObservedAt, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &changes, &before, &after); err != nil {
+		var muted int
+		if err := eventRows.Scan(&event.ID, &event.Generation, &event.ObservedAt, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &changes, &before, &after, &muted); err != nil {
 			eventRows.Close()
 			return nil, evidenceLedgerBatch{}, err
 		}
 		event.Changes, event.Before, event.After = string(changes), string(before), string(after)
+		event.Muted = muted == 1
 		batch.Events = append(batch.Events, event)
 	}
 	if err := eventRows.Err(); err != nil {
