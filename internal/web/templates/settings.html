@@ -269,4 +269,180 @@
     <button type="submit">Add mute rule</button>
   </form>
 </section>
+
+<section class="card account-card" id="account" aria-labelledby="account-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="account-heading">Account security</h2>
+      <p>Sessions end 12 hours after sign-in or after {{.SessionIdleMinutes}} minutes without activity; the status page's automatic refresh does not count as activity.</p>
+    </div>
+  </div>
+  <h3 id="password-heading">Change password</h3>
+  <form method="post" action="/settings/password" aria-labelledby="password-heading">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <div class="grid">
+      <label for="current-password">Current password
+        <input id="current-password" type="password" name="current_password" autocomplete="current-password" required>
+      </label>
+      <label for="new-password">New password
+        <input id="new-password" type="password" name="password" minlength="{{.MinPasswordLength}}" autocomplete="new-password" aria-describedby="new-password-help" required>
+        <small id="new-password-help">At least {{.MinPasswordLength}} characters; common passwords are rejected.</small>
+      </label>
+      <label for="confirm-password">Confirm new password
+        <input id="confirm-password" type="password" name="confirm" minlength="{{.MinPasswordLength}}" autocomplete="new-password" required>
+      </label>
+    </div>
+    <p class="muted">Changing the password signs out every other session.</p>
+    <button type="submit">Change password</button>
+  </form>
+  <h3 id="sessions-heading">Active sessions</h3>
+  {{if .Sessions}}
+  <table class="data-table session-table" aria-labelledby="sessions-heading">
+    <thead>
+      <tr>
+        <th scope="col">Session</th>
+        <th scope="col">Signed in</th>
+        <th scope="col">Last activity</th>
+        <th scope="col">Expires</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .Sessions}}
+      <tr{{if .Current}} aria-current="true"{{end}}>
+        <th scope="row" data-label="Session"><code>{{.Ref}}</code>{{if .Current}} <span class="status-pill status-enabled">This session</span>{{end}}</th>
+        <td data-label="Signed in">{{template "when" (when .CreatedAt $.Now)}}</td>
+        <td data-label="Last activity">{{template "when" (when .LastSeenAt $.Now)}}</td>
+        <td data-label="Expires">{{template "when" (when .ExpiresAt $.Now)}}</td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No active sessions.</p>
+  {{end}}
+  <form method="post" action="/settings/sessions/revoke-others">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <button class="button-danger" type="submit">Sign out all other sessions</button>
+  </form>
+</section>
+
+<section class="card api-card" id="api-tokens" aria-labelledby="api-tokens-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="api-tokens-heading">API tokens</h2>
+      <p>Read-only tokens for SIEM, SOAR, and compliance tooling. Send a token as <code>Authorization: Bearer &lt;token&gt;</code> to <code>/api/v1/status</code> (<code>status:read</code>), <code>/api/v1/history</code> (<code>history:read</code>), or <code>/api/v1/evidence</code> (<code>evidence:read</code>). Tokens are stored hashed, shown only once, expire, and can be revoked at any time.</p>
+    </div>
+  </div>
+  {{if .NewAPIToken}}
+  <div class="success new-token" id="new-api-token" role="group" aria-labelledby="new-api-token-heading">
+    <h3 id="new-api-token-heading">New API token</h3>
+    <label for="new-api-token-value">Token value
+      <input id="new-api-token-value" class="token-value" value="{{.NewAPIToken}}" readonly autocomplete="off" spellcheck="false" aria-describedby="new-api-token-help">
+    </label>
+    <small id="new-api-token-help">Copy it now. It is not stored and will not be shown again, not even after reloading this page.</small>
+  </div>
+  {{end}}
+  {{if .APITokens}}
+  <table class="data-table api-token-table">
+    <caption class="visually-hidden">API tokens</caption>
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Scopes</th>
+        <th scope="col">Expires</th>
+        <th scope="col">Last used</th>
+        <th scope="col">Status</th>
+        <th scope="col">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .APITokens}}
+      <tr>
+        <th scope="row" data-label="Name">{{.Name}}</th>
+        <td data-label="Scopes">{{range $index, $scope := .Scopes}}{{if $index}}, {{end}}<code>{{$scope}}</code>{{end}}</td>
+        <td data-label="Expires">{{template "when" (when .ExpiresAt $.Now)}}</td>
+        <td data-label="Last used">{{if .LastUsedAt}}{{template "when" (when .LastUsedAt $.Now)}}{{else}}Never{{end}}</td>
+        <td data-label="Status">{{.Status}}</td>
+        <td data-label="Action">
+          {{- if eq .Status "active"}}
+          <form method="post" action="/settings/api-tokens">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="action" value="revoke">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button class="button-danger" type="submit" aria-label="Revoke API token {{.Name}}">Revoke</button>
+          </form>
+          {{- else}}
+          <span class="muted">—</span>
+          {{- end}}
+        </td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No API tokens.</p>
+  {{end}}
+  <h3 id="create-api-token-heading">Create an API token</h3>
+  <form method="post" action="/settings/api-tokens" aria-labelledby="create-api-token-heading">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="create">
+    <div class="grid">
+      <label for="api-token-name">Name
+        <input id="api-token-name" name="name" maxlength="64" required placeholder="SIEM export" autocomplete="off" spellcheck="false">
+      </label>
+      <label for="api-token-expiry">Expires after
+        <select id="api-token-expiry" name="expires_days">
+          {{- range .APITokenLifetimes}}
+          <option value="{{.}}"{{if eq . 90}} selected{{end}}>{{.}} days</option>
+          {{- end}}
+        </select>
+      </label>
+    </div>
+    <fieldset class="check-row">
+      <legend>Scopes</legend>
+      {{- range .APIScopes}}
+      <label class="check-label" for="api-token-scope-{{.}}"><input id="api-token-scope-{{.}}" type="checkbox" name="scopes" value="{{.}}"> <span>{{.}}</span></label>
+      {{- end}}
+    </fieldset>
+    <button type="submit">Create API token</button>
+  </form>
+</section>
+
+<section class="card activity-card" id="activity" aria-labelledby="activity-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="activity-heading">Recent administrative activity</h2>
+      <p>Sign-ins, password and session changes, configuration changes, and operator actions, newest first. Only the names of changed fields are recorded, never their values. Records are kept for 365 days and are also written to the log as <code>administrative action</code> lines.</p>
+    </div>
+  </div>
+  {{if .AdminActivity}}
+  <table class="data-table activity-table">
+    <caption class="visually-hidden">Administrative activity, newest first</caption>
+    <thead>
+      <tr>
+        <th scope="col">Time</th>
+        <th scope="col">Action</th>
+        <th scope="col">Outcome</th>
+        <th scope="col">Changed</th>
+        <th scope="col">Client</th>
+        <th scope="col">Session</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .AdminActivity}}
+      <tr{{if eq .Outcome "failure"}} class="failure"{{end}}>
+        <td data-label="Time">{{template "when" (when .At $.Now)}}</td>
+        <th scope="row" data-label="Action">{{.Label}}{{if .Target}} <code>{{.Target}}</code>{{end}}</th>
+        <td data-label="Outcome">{{.Outcome}}</td>
+        <td data-label="Changed">{{range $index, $field := .Fields}}{{if $index}}, {{end}}<code>{{$field}}</code>{{else}}—{{end}}</td>
+        <td data-label="Client">{{if .ClientIP}}<code>{{.ClientIP}}</code>{{else}}—{{end}}</td>
+        <td data-label="Session">{{if .SessionRef}}<code>{{.SessionRef}}</code>{{else}}—{{end}}</td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No administrative activity recorded yet.</p>
+  {{end}}
+</section>
 {{end}}
