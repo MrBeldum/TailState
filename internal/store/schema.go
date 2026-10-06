@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 15 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -26,9 +26,35 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   csrf_hash TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
+-- Administrative audit trail: event names, field names, and identifiers
+-- only, never values. Retained for 365 days by bounded cleanup.
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  event TEXT NOT NULL,
+  outcome TEXT NOT NULL DEFAULT 'success',
+  client_ip TEXT NOT NULL DEFAULT '',
+  session_ref TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  fields TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS admin_audit_created_at ON admin_audit(created_at, id);
+-- Scoped read-only API tokens. Only the SHA-256 hash of a token is stored.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS api_tokens_expires_at ON api_tokens(expires_at, id);
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK(id = 1),
   tailnet TEXT NOT NULL,

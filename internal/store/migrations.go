@@ -268,6 +268,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 14 {
+		if err := migrateSchemaV14ToV15(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -859,6 +865,67 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 	}
 	if err := finalTx.Commit(); err != nil {
 		return fmt.Errorf("commit notification routing migration: %w", err)
+	}
+	return nil
+}
+
+// migrateSchemaV14ToV15 adds administrative security state: a last-seen
+// time on sessions for the idle timeout, the administrative audit table, and
+// hashed read-only API tokens.
+// Existing sessions are backfilled with their creation time, so a session
+// idle for longer than the timeout before the upgrade must sign in again;
+// nothing else changes behaviour.
+func migrateSchemaV14ToV15(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin administrative security migration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissing(tx, "sessions", "last_seen_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE sessions SET last_seen_at=created_at WHERE last_seen_at=''"); err != nil {
+		return fmt.Errorf("backfill session activity: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS admin_audit (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			event TEXT NOT NULL,
+			outcome TEXT NOT NULL DEFAULT 'success',
+			client_ip TEXT NOT NULL DEFAULT '',
+			session_ref TEXT NOT NULL DEFAULT '',
+			target TEXT NOT NULL DEFAULT '',
+			fields TEXT NOT NULL DEFAULT ''
+		)`,
+		"CREATE INDEX IF NOT EXISTS admin_audit_created_at ON admin_audit(created_at, id)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("create administrative audit table: %w", err)
+		}
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			scopes TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT,
+			last_used_at TEXT
+		)`,
+		"CREATE INDEX IF NOT EXISTS api_tokens_expires_at ON api_tokens(expires_at, id)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("create API token table: %w", err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=15"); err != nil {
+		return fmt.Errorf("record administrative security migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit administrative security migration: %w", err)
 	}
 	return nil
 }
